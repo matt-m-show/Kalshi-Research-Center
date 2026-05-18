@@ -1,0 +1,25 @@
+# config/alerts.yaml — Alert thresholds for the Performance Agent
+
+calibration:
+  brier_warn_threshold: 0.30      # warn if rolling Brier > this
+  brier_halt_threshold: null      # auto-halt if Brier > this (null = never auto-halt on calibration alone)
+
+drawdown:
+  warn_pct: 0.10                  # warn at 10% of bankroll drawdown
+  halt_pct: 0.20                  # auto-halt at 20% of bankroll drawdown
+
+concentration:
+  category_pnl_warn_pct: 0.40     # warn if one category > 40% of total P&L contribution
+
+consecutive_losses:
+  warn: 4
+  halt: 6
+
+api_health:
+  error_rate_halt_per_min: 10     # halt if API errors/min > this
+  auth_failure_immediate_halt: true
+
+graduation:
+  # Thresholds are read from config/promotion.yaml
+  # This section controls how often the Performance Agent checks for graduation readiness
+  check_interval_hours: 24

@@ -1,0 +1,44 @@
+# config/sources.yaml — Research source configuration
+# The Research Agent uses these to find and evaluate news/social signals.
+
+tier1:
+  # Primary / wire services — treated as authoritative
+  outlets:
+    - name: "Associated Press"
+      rss: "https://rsshub.app/ap/topics/politics"
+    - name: "Reuters"
+      rss: "https://feeds.reuters.com/reuters/topNews"
+    - name: "Bloomberg"
+      web: "https://www.bloomberg.com"    # no free RSS; use WebFetch
+    # Add official government/regulatory sources relevant to your market categories:
+    # - name: "Federal Reserve"
+    #   web: "https://www.federalreserve.gov/newsevents.htm"
+    # - name: "BLS"
+    #   web: "https://www.bls.gov/news.release/"
+
+tier2:
+  # Reputable analysis / established news — used as supporting evidence
+  outlets:
+    - name: "FiveThirtyEight / ABC News"
+      web: "https://abcnews.go.com/538"
+    - name: "Politico"
+      rss: "https://rss.politico.com/politics-news.xml"
+    - name: "The Hill"
+      rss: "https://thehill.com/feed/"
+    # Add others relevant to your categories
+
+tier3:
+  # Social / forums — used as weak signal only; never sole justification
+  enabled: false    # set to true if you have API keys configured
+  sources:
+    # x_accounts: []       # specific X/Twitter accounts to follow
+    # subreddits: []       # e.g. ["politics", "PredictIt"]
+    # polymarket_signals: false
+
+domain_blocklist:
+  # URLs matching these domains are never cited
+  - "tabloids.example.com"
+  - "*.onion"
+
+news_api_key: null    # Optional: set to your NewsAPI.org key for broader coverage
+                      # Store in OS env var NEWSAPI_KEY rather than here

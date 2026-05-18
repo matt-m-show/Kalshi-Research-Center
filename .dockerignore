@@ -1,0 +1,30 @@
+# Version control
+.git
+.gitignore
+
+# Runtime data — mounted as volumes, never baked into the image
+data/
+logs/
+metrics/
+reports/
+
+# Secrets — never baked into the image
+.env
+*.pem
+.kalshi/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.hypothesis/
+.ruff_cache/
+dist/
+build/
+
+# Dev / editor
+.vscode/
+.idea/
+*.swp

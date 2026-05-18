@@ -1,0 +1,17 @@
+# config/promotion.yaml — Paper-to-live and HITL-to-autonomous promotion gates
+# All <TBD> values must be set before /promote-to-live will execute.
+
+paper_to_hitl_live:
+  min_calendar_days: 14           # suggested: 30
+  min_closed_trades: 50           # suggested: 100
+  max_brier_score: 0.25             # e.g. 0.25 (calibration threshold)
+  min_return_pct: 0.05              # e.g. 0.05 (5% return over paper period)
+  max_drawdown_pct: 0.5            # e.g. 0.15 (max 15% drawdown during paper)
+  max_unresolved_sev1_incidents: 0
+
+hitl_live_to_autonomous:
+  min_hitl_days: 30               # additional days in HITL live before going autonomous
+  min_hitl_closed_trades: 25      # e.g. 50
+  max_brier_score: 0.25             # same or stricter than paper gate
+  max_drawdown_pct: 0.5
+  max_unresolved_sev1_incidents: 0

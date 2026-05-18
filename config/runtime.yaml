@@ -1,0 +1,17 @@
+# Updated via dashboard — 2026-05-10 12:41 UTC
+research:
+  interval_minutes: 960
+  max_recommendations_per_run: 10
+reconciliation:
+  interval_seconds: 30
+mark_to_market:
+  interval_minutes: 5
+reporting:
+  daily_report_utc_hour: 23
+  weekly_report_day: 6
+notifications:
+  desktop: true
+  email_drafts: false
+  quiet_hours_utc_start: 3
+  quiet_hours_utc_end: 10
+timezone: America/New_York

@@ -1,0 +1,1111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Kalshi Trading System</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { font-family: 'Inter', system-ui, -apple-system, sans-serif; }
+    .dot { width:10px; height:10px; border-radius:50%; display:inline-block; flex-shrink:0; }
+    .dot-running  { background:#22c55e; animation:pulse-dot 1.8s infinite; }
+    .dot-idle     { background:#22c55e; }
+    .dot-stopped  { background:#475569; }
+    .dot-error    { background:#ef4444; animation:pulse-dot 1.2s infinite; }
+    .dot-checking { background:#f59e0b; animation:pulse-dot 1.5s infinite; }
+    @keyframes pulse-dot { 0%,100%{opacity:1} 50%{opacity:.3} }
+    .feed-in { animation:slide-in .25s ease; }
+    @keyframes slide-in { from{opacity:0;transform:translateY(-8px)} to{opacity:1;transform:translateY(0)} }
+    ::-webkit-scrollbar { width:5px; height:5px; }
+    ::-webkit-scrollbar-track { background:#0f172a; }
+    ::-webkit-scrollbar-thumb { background:#334155; border-radius:3px; }
+    ::-webkit-scrollbar-thumb:hover { background:#475569; }
+    .tab-active { border-bottom-color:#3b82f6 !important; color:#93c5fd !important; }
+    .badge-approve { background:#14532d; color:#86efac; }
+    .badge-modify  { background:#451a03; color:#fcd34d; }
+    .badge-deny    { background:#450a0a; color:#fca5a5; }
+    .badge-pending { background:#1e293b; color:#94a3b8; }
+    .settings-input { background:#1e293b; border:1px solid #334155; border-radius:6px; padding:6px 10px; color:#e2e8f0; width:100%; font-size:13px; }
+    .settings-input:focus { outline:none; border-color:#3b82f6; }
+    .settings-label { font-size:11px; color:#94a3b8; margin-bottom:3px; display:block; }
+    .settings-section { background:#1e293b; border:1px solid #334155; border-radius:12px; padding:20px; margin-bottom:16px; }
+    .settings-section h3 { font-size:13px; font-weight:600; color:#94a3b8; text-transform:uppercase; letter-spacing:.05em; margin-bottom:14px; }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen flex flex-col">
+
+<!-- ═══════════════════ HEADER ═══════════════════ -->
+<header class="bg-slate-900 border-b border-slate-700/80 px-5 py-3 flex items-center gap-4 sticky top-0 z-50 shadow-xl">
+  <span class="text-lg font-bold tracking-tight text-white mr-1">⚡ Kalshi</span>
+  <span id="badge-env"  class="px-2 py-0.5 rounded text-xs font-bold bg-blue-950 text-blue-300 border border-blue-800">DEMO</span>
+  <span id="badge-mode" class="px-2 py-0.5 rounded text-xs font-bold bg-purple-950 text-purple-300 border border-purple-800">PAPER</span>
+  <span id="badge-sys"  class="px-2 py-0.5 rounded text-xs font-bold bg-slate-800 text-slate-300 border border-slate-600">IDLE</span>
+  <div class="flex-1"></div>
+  <button id="btn-run-now" onclick="runNow()"
+    class="px-3 py-1.5 bg-blue-700 hover:bg-blue-600 active:bg-blue-800 rounded-lg text-sm font-semibold transition-colors">
+    ▶ Run Now
+  </button>
+  <button id="btn-start" onclick="startAgents()"
+    class="px-3 py-1.5 bg-emerald-800 hover:bg-emerald-700 rounded-lg text-sm font-semibold transition-colors">
+    Start Agents
+  </button>
+  <button id="btn-stop" onclick="stopAgents()" disabled
+    class="px-3 py-1.5 bg-slate-700 hover:bg-slate-600 rounded-lg text-sm font-semibold transition-colors disabled:opacity-40 disabled:cursor-not-allowed">
+    Stop Agents
+  </button>
+  <div class="w-px h-5 bg-slate-600"></div>
+  <button id="btn-mode" onclick="toggleMode()"
+    class="px-3 py-1.5 rounded-lg text-sm font-semibold transition-colors bg-slate-700 hover:bg-slate-600"
+    title="Switch between HITL and Autonomous mode">
+    HITL
+  </button>
+  <div class="w-px h-5 bg-slate-600"></div>
+  <button id="btn-halt" onclick="haltSystem()"
+    class="px-3 py-1.5 bg-red-900 hover:bg-red-800 rounded-lg text-sm font-semibold transition-colors">
+    🛑 Halt
+  </button>
+  <button id="btn-resume" onclick="resumeSystem()"
+    class="px-3 py-1.5 bg-emerald-900 hover:bg-emerald-800 rounded-lg text-sm font-semibold transition-colors hidden">
+    ▶ Resume
+  </button>
+  <div class="w-px h-5 bg-slate-600"></div>
+  <div class="flex items-center gap-1.5">
+    <span class="dot dot-checking" id="dot-ws"></span>
+    <span class="text-xs text-slate-400" id="lbl-ws">connecting</span>
+  </div>
+</header>
+
+<!-- ═══════════════════ AGENT STATUS ROW ═══════════════════ -->
+<div class="bg-slate-900/60 border-b border-slate-700/60 px-5 py-2.5 flex items-center gap-3 flex-wrap">
+  <div class="flex items-center gap-2 bg-slate-800/70 rounded-lg px-3.5 py-2 border border-slate-700/50">
+    <span class="dot dot-stopped" id="dot-research"></span>
+    <div><div class="text-xs text-slate-500 leading-tight">Research</div>
+    <div class="text-xs font-semibold" id="lbl-research">stopped</div></div>
+  </div>
+  <div class="flex items-center gap-2 bg-slate-800/70 rounded-lg px-3.5 py-2 border border-slate-700/50">
+    <span class="dot dot-stopped" id="dot-qa"></span>
+    <div><div class="text-xs text-slate-500 leading-tight">QA Engine</div>
+    <div class="text-xs font-semibold" id="lbl-qa">stopped</div></div>
+  </div>
+  <div class="flex items-center gap-2 bg-slate-800/70 rounded-lg px-3.5 py-2 border border-slate-700/50">
+    <span class="dot dot-stopped" id="dot-execute"></span>
+    <div><div class="text-xs text-slate-500 leading-tight">Execute</div>
+    <div class="text-xs font-semibold" id="lbl-execute">stopped</div></div>
+  </div>
+  <div class="flex items-center gap-2 bg-slate-800/70 rounded-lg px-3.5 py-2 border border-slate-700/50">
+    <span class="dot dot-stopped" id="dot-performance"></span>
+    <div><div class="text-xs text-slate-500 leading-tight">Performance</div>
+    <div class="text-xs font-semibold" id="lbl-performance">stopped</div></div>
+  </div>
+  <div class="w-px h-7 bg-slate-700 mx-1"></div>
+  <div class="flex items-center gap-2 bg-slate-800/70 rounded-lg px-3.5 py-2 border border-slate-700/50">
+    <span class="dot dot-checking" id="dot-kalshi"></span>
+    <div><div class="text-xs text-slate-500 leading-tight">Kalshi API</div>
+    <div class="text-xs font-semibold" id="lbl-kalshi">checking…</div></div>
+  </div>
+  <div class="flex-1"></div>
+  <span class="text-xs text-slate-600" id="lbl-updated"></span>
+</div>
+
+<!-- ═══════════════════ TABS ═══════════════════ -->
+<div class="bg-slate-900/40 border-b border-slate-700/60 px-5 flex">
+  <button class="tab-btn tab-active border-b-2 border-transparent px-4 py-2.5 text-sm font-medium text-slate-400 hover:text-white transition-colors" onclick="switchTab('overview')" id="tab-overview">Overview</button>
+  <button class="tab-btn border-b-2 border-transparent px-4 py-2.5 text-sm font-medium text-slate-400 hover:text-white transition-colors" onclick="switchTab('pending')" id="tab-pending">
+    Pending Approval
+    <span id="badge-pending-count" class="hidden ml-1.5 px-1.5 py-0.5 bg-amber-600 text-white rounded text-xs font-bold">0</span>
+  </button>
+  <button class="tab-btn border-b-2 border-transparent px-4 py-2.5 text-sm font-medium text-slate-400 hover:text-white transition-colors" onclick="switchTab('recommendations')" id="tab-recommendations">Recommendations</button>
+  <button class="tab-btn border-b-2 border-transparent px-4 py-2.5 text-sm font-medium text-slate-400 hover:text-white transition-colors" onclick="switchTab('feed')" id="tab-feed">Live Feed</button>
+  <button class="tab-btn border-b-2 border-transparent px-4 py-2.5 text-sm font-medium text-slate-400 hover:text-white transition-colors" onclick="switchTab('settings')" id="tab-settings">⚙ Settings</button>
+</div>
+
+<!-- ═══════════════════ MAIN CONTENT ═══════════════════ -->
+<main class="flex-1 p-5 overflow-auto">
+
+  <!-- ── OVERVIEW ── -->
+  <section id="sec-overview">
+    <!-- System stats -->
+    <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4 mb-6">
+      <div class="bg-slate-800/60 rounded-xl p-4 border border-slate-700/40">
+        <div class="text-xs text-slate-500 mb-1">Total Recs</div>
+        <div class="text-2xl font-bold" id="stat-recs">—</div>
+      </div>
+      <div class="bg-slate-800/60 rounded-xl p-4 border border-slate-700/40">
+        <div class="text-xs text-slate-500 mb-1">Approved</div>
+        <div class="text-2xl font-bold text-emerald-400" id="stat-approved">—</div>
+      </div>
+      <div class="bg-slate-800/60 rounded-xl p-4 border border-slate-700/40">
+        <div class="text-xs text-slate-500 mb-1">Denied</div>
+        <div class="text-2xl font-bold text-red-400" id="stat-denied">—</div>
+      </div>
+      <div class="bg-slate-800/60 rounded-xl p-4 border border-slate-700/40">
+        <div class="text-xs text-slate-500 mb-1">Pending</div>
+        <div class="text-2xl font-bold text-amber-400" id="stat-pending">—</div>
+      </div>
+      <div class="bg-slate-800/60 rounded-xl p-4 border border-slate-700/40">
+        <div class="text-xs text-slate-500 mb-1">Paper P&amp;L</div>
+        <div class="text-2xl font-bold" id="stat-pnl">—</div>
+      </div>
+      <div class="bg-slate-800/60 rounded-xl p-4 border border-slate-700/40">
+        <div class="text-xs text-slate-500 mb-1">Brier Score</div>
+        <div class="text-2xl font-bold" id="stat-brier">—</div>
+      </div>
+    </div>
+
+    <!-- Kalshi Account Portfolio -->
+    <div class="mb-6">
+      <div class="flex items-center justify-between mb-3">
+        <h2 class="text-sm font-semibold text-slate-400 uppercase tracking-wide">Kalshi Account</h2>
+        <button onclick="loadPortfolio()" class="text-xs text-slate-500 hover:text-slate-300 transition-colors px-2 py-1 rounded border border-slate-700 hover:border-slate-500">↻ Refresh</button>
+      </div>
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-4">
+        <div class="bg-slate-800/60 rounded-xl p-4 border border-slate-700/40">
+          <div class="text-xs text-slate-500 mb-1">Cash Available</div>
+          <div class="text-2xl font-bold text-emerald-400" id="port-balance">—</div>
+        </div>
+        <div class="bg-slate-800/60 rounded-xl p-4 border border-slate-700/40">
+          <div class="text-xs text-slate-500 mb-1">In Open Orders</div>
+          <div class="text-2xl font-bold text-amber-400" id="port-reserved">—</div>
+        </div>
+        <div class="bg-slate-800/60 rounded-xl p-4 border border-slate-700/40">
+          <div class="text-xs text-slate-500 mb-1">Unrealized P&amp;L</div>
+          <div class="text-2xl font-bold" id="port-pnl">—</div>
+        </div>
+        <div class="bg-slate-800/60 rounded-xl p-4 border border-slate-700/40">
+          <div class="text-xs text-slate-500 mb-1">Open Orders</div>
+          <div class="text-2xl font-bold text-slate-300" id="port-orders">—</div>
+        </div>
+      </div>
+      <!-- Positions table -->
+      <div id="positions-wrap" class="hidden">
+        <div class="text-xs text-slate-500 uppercase tracking-wide mb-2">Current Positions</div>
+        <div class="overflow-x-auto rounded-xl border border-slate-700/40">
+          <table class="w-full text-sm">
+            <thead>
+              <tr class="bg-slate-800/80 text-xs text-slate-400 uppercase tracking-wide">
+                <th class="text-left px-4 py-2">Market</th>
+                <th class="px-4 py-2">Contracts</th>
+                <th class="text-right px-4 py-2">Cost</th>
+                <th class="text-right px-4 py-2">Unrealized P&amp;L</th>
+                <th class="text-right px-4 py-2">Realized P&amp;L</th>
+              </tr>
+            </thead>
+            <tbody id="positions-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div id="port-error" class="hidden text-xs text-red-400 mt-2"></div>
+    </div>
+
+    <p class="text-slate-600 text-sm">Use <strong class="text-slate-400">Start Agents</strong> to begin the trading loop, or <strong class="text-slate-400">Run Now</strong> for a single research cycle.</p>
+  </section>
+
+  <!-- ── PENDING APPROVAL ── -->
+  <section id="sec-pending" class="hidden">
+    <!-- Active pending trades -->
+    <div id="pending-list"></div>
+
+    <!-- History: recently actioned trades -->
+    <div id="history-wrap" class="hidden mt-8">
+      <div class="flex items-center gap-3 mb-3">
+        <div class="flex-1 h-px bg-slate-800"></div>
+        <span class="text-xs text-slate-600 uppercase tracking-wide font-semibold">Recent Actions</span>
+        <div class="flex-1 h-px bg-slate-800"></div>
+      </div>
+      <div id="history-list" class="space-y-2"></div>
+    </div>
+  </section>
+
+  <!-- ── RECOMMENDATIONS ── -->
+  <section id="sec-recommendations" class="hidden">
+    <div class="overflow-x-auto rounded-xl border border-slate-700/40">
+      <table class="w-full text-sm">
+        <thead>
+          <tr class="bg-slate-800/80 text-xs text-slate-400 uppercase tracking-wide">
+            <th class="text-left px-4 py-2.5">Time (UTC)</th>
+            <th class="text-left px-4 py-2.5">Market</th>
+            <th class="px-4 py-2.5">Side</th>
+            <th class="text-right px-4 py-2.5">Price</th>
+            <th class="text-right px-4 py-2.5">Qty</th>
+            <th class="text-right px-4 py-2.5">Cost</th>
+            <th class="text-right px-4 py-2.5">Edge</th>
+            <th class="px-4 py-2.5">Conf</th>
+            <th class="px-4 py-2.5">Verdict</th>
+            <th class="text-left px-4 py-2.5">Notes / Thesis</th>
+          </tr>
+        </thead>
+        <tbody id="recs-tbody">
+          <tr><td colspan="10" class="text-center py-12 text-slate-600">No recommendations yet.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <!-- ── LIVE FEED ── -->
+  <section id="sec-feed" class="hidden">
+    <div id="feed-list" class="space-y-1.5 max-h-[calc(100vh-220px)] overflow-y-auto pr-1">
+      <div class="text-slate-600 text-sm text-center py-12">Waiting for events…</div>
+    </div>
+  </section>
+
+  <!-- ── SETTINGS ── -->
+  <section id="sec-settings" class="hidden max-w-4xl">
+    <div class="flex items-center justify-between mb-5">
+      <div>
+        <h2 class="text-base font-semibold text-white">System Settings</h2>
+        <p class="text-xs text-slate-500 mt-0.5">Changes take effect on the next research cycle. Saving overwrites the config files.</p>
+      </div>
+      <button onclick="loadSettings()" class="text-xs text-slate-500 hover:text-slate-300 px-2 py-1 rounded border border-slate-700 hover:border-slate-500 transition-colors">↻ Reload from files</button>
+    </div>
+    <div id="settings-alert" class="hidden mb-4 px-4 py-3 rounded-lg text-sm font-medium"></div>
+    <div id="settings-body">
+      <div class="text-slate-600 text-sm py-12 text-center">Loading settings…</div>
+    </div>
+  </section>
+
+</main>
+
+<!-- ═══════════════════ SCRIPTS ═══════════════════ -->
+<script>
+// ──────────────────────────────────────────────────────────────────────────
+// State
+// ──────────────────────────────────────────────────────────────────────────
+let ws = null, wsReconnTimer = null, currentTab = 'overview';
+let settingsCache = null; // loaded yaml configs
+
+// ──────────────────────────────────────────────────────────────────────────
+// Utility
+// ──────────────────────────────────────────────────────────────────────────
+function escHtml(s) {
+  return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function fmtUsd(cents) {
+  if (cents == null) return '—';
+  const sign = cents < 0 ? '-' : '';
+  return sign + '$' + (Math.abs(cents)/100).toFixed(2);
+}
+function fmtPnl(cents) {
+  if (cents == null) return { text: '—', cls: 'text-slate-300' };
+  const sign = cents >= 0 ? '+' : '';
+  return { text: sign + '$' + (Math.abs(cents)/100).toFixed(2), cls: cents >= 0 ? 'text-emerald-400' : 'text-red-400' };
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Tab switching
+// ──────────────────────────────────────────────────────────────────────────
+function switchTab(name) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('tab-active'));
+  document.querySelectorAll('section[id^="sec-"]').forEach(s => s.classList.add('hidden'));
+  document.getElementById(`tab-${name}`).classList.add('tab-active');
+  document.getElementById(`sec-${name}`).classList.remove('hidden');
+  currentTab = name;
+  if (name === 'recommendations') loadRecs();
+  if (name === 'pending') loadPending();
+  if (name === 'overview') loadPortfolio();
+  if (name === 'settings') loadSettings();
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Status bar
+// ──────────────────────────────────────────────────────────────────────────
+function applyStatus(status) {
+  if (!status) return;
+  document.getElementById('badge-env').textContent = (status.env || 'demo').toUpperCase();
+  document.getElementById('badge-mode').textContent = (status.mode || 'paper').toUpperCase();
+  const halted = status.halted, running = status.agents_running;
+  const badgeSys = document.getElementById('badge-sys');
+  if (halted) { badgeSys.textContent='HALTED'; badgeSys.className='px-2 py-0.5 rounded text-xs font-bold bg-red-950 text-red-300 border border-red-800'; }
+  else if (running) { badgeSys.textContent='RUNNING'; badgeSys.className='px-2 py-0.5 rounded text-xs font-bold bg-emerald-950 text-emerald-300 border border-emerald-800'; }
+  else { badgeSys.textContent='IDLE'; badgeSys.className='px-2 py-0.5 rounded text-xs font-bold bg-slate-800 text-slate-300 border border-slate-600'; }
+  document.getElementById('btn-halt').classList.toggle('hidden', halted);
+  document.getElementById('btn-resume').classList.toggle('hidden', !halted);
+  document.getElementById('btn-start').disabled = running;
+  document.getElementById('btn-stop').disabled = !running;
+  const modeBtn = document.getElementById('btn-mode');
+  const isAuto = (status.mode || '').toLowerCase() === 'autonomous';
+  modeBtn.textContent = isAuto ? '🤖 AUTO' : '👤 HITL';
+  modeBtn.className = `px-3 py-1.5 rounded-lg text-sm font-semibold transition-colors ${isAuto ? 'bg-purple-800 hover:bg-purple-700 text-white' : 'bg-slate-700 hover:bg-slate-600 text-slate-200'}`;
+  const statuses = status.agent_statuses || {};
+  for (const [agent, s] of Object.entries(statuses)) setAgentDot(agent, s);
+  setKalshiDot(status.kalshi_connected);
+  document.getElementById('lbl-updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
+}
+
+function setAgentDot(agent, status) {
+  const dot = document.getElementById(`dot-${agent}`), lbl = document.getElementById(`lbl-${agent}`);
+  if (!dot || !lbl) return;
+  const cls = { running:'dot-running', idle:'dot-idle', error:'dot-error', stopped:'dot-stopped' };
+  const col = { running:'text-emerald-400', idle:'text-emerald-400', error:'text-red-400', stopped:'text-slate-500' };
+  dot.className = `dot ${cls[status]||'dot-stopped'}`;
+  lbl.textContent = status;
+  lbl.className = `text-xs font-semibold ${col[status]||'text-slate-500'}`;
+}
+
+function setKalshiDot(connected) {
+  const dot = document.getElementById('dot-kalshi'), lbl = document.getElementById('lbl-kalshi');
+  if (connected) { dot.className='dot dot-idle'; lbl.textContent='connected'; lbl.className='text-xs font-semibold text-emerald-400'; }
+  else { dot.className='dot dot-error'; lbl.textContent='disconnected'; lbl.className='text-xs font-semibold text-red-400'; }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Portfolio (Overview tab)
+// ──────────────────────────────────────────────────────────────────────────
+async function loadPortfolio() {
+  try {
+    const d = await fetch('/api/portfolio').then(r => r.json());
+    const errEl = document.getElementById('port-error');
+
+    if (!d.ok) {
+      document.getElementById('port-balance').textContent = '—';
+      document.getElementById('port-reserved').textContent = '—';
+      document.getElementById('port-pnl').textContent = '—';
+      document.getElementById('port-orders').textContent = '—';
+      errEl.textContent = 'Could not reach Kalshi: ' + (d.error || 'unknown');
+      errEl.classList.remove('hidden');
+      return;
+    }
+    errEl.classList.add('hidden');
+
+    document.getElementById('port-balance').textContent = fmtUsd(d.balance_cents);
+    document.getElementById('port-reserved').textContent = fmtUsd(d.reserved_cents);
+    document.getElementById('port-orders').textContent = d.open_orders_count ?? '0';
+
+    const pnl = fmtPnl(d.unrealized_pnl_cents);
+    const pnlEl = document.getElementById('port-pnl');
+    pnlEl.textContent = pnl.text;
+    pnlEl.className = `text-2xl font-bold ${pnl.cls}`;
+
+    // Positions table
+    const posWrap = document.getElementById('positions-wrap');
+    const tbody = document.getElementById('positions-tbody');
+    if (d.positions && d.positions.length > 0) {
+      posWrap.classList.remove('hidden');
+      tbody.innerHTML = d.positions.map(p => {
+        const sideLabel = p.position > 0 ? `<span class="text-emerald-400 font-bold">YES</span>` : `<span class="text-red-400 font-bold">NO</span>`;
+        const qty = Math.abs(p.position);
+        const upnl = fmtPnl(p.unrealized_pnl_cents);
+        const rpnl = fmtPnl(p.realized_pnl_cents);
+        return `<tr class="border-t border-slate-800/60 hover:bg-slate-800/20">
+          <td class="px-4 py-2.5">
+            <div class="font-mono text-xs text-white">${escHtml(p.ticker)}</div>
+          </td>
+          <td class="px-4 py-2.5 text-center">${sideLabel} <span class="text-slate-300 ml-1">${qty}</span></td>
+          <td class="px-4 py-2.5 text-right tabular-nums text-slate-300">${fmtUsd(p.total_cost_cents)}</td>
+          <td class="px-4 py-2.5 text-right tabular-nums ${upnl.cls}">${upnl.text}</td>
+          <td class="px-4 py-2.5 text-right tabular-nums ${rpnl.cls}">${rpnl.text}</td>
+        </tr>`;
+      }).join('');
+    } else {
+      posWrap.classList.add('hidden');
+    }
+  } catch(e) {
+    document.getElementById('port-error').textContent = 'Portfolio load failed: ' + e.message;
+    document.getElementById('port-error').classList.remove('hidden');
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Performance stats
+// ──────────────────────────────────────────────────────────────────────────
+async function loadPerf() {
+  try {
+    const d = await fetch('/api/performance').then(r => r.json());
+    document.getElementById('stat-recs').textContent = d.total_recs ?? '—';
+    document.getElementById('stat-approved').textContent = d.approved ?? '—';
+    document.getElementById('stat-denied').textContent = d.denied ?? '—';
+    document.getElementById('stat-pending').textContent = d.pending ?? '—';
+    const pnl = d.total_pnl_cents;
+    const el = document.getElementById('stat-pnl');
+    if (pnl != null) { el.textContent = (pnl>=0?'+':'') + '$' + (Math.abs(pnl)/100).toFixed(2); el.className = `text-2xl font-bold ${pnl>=0?'text-emerald-400':'text-red-400'}`; }
+    document.getElementById('stat-brier').textContent = d.brier_score != null ? d.brier_score.toFixed(3) : '—';
+    const cnt = d.pending || 0;
+    const badge = document.getElementById('badge-pending-count');
+    badge.textContent = cnt;
+    badge.classList.toggle('hidden', cnt === 0);
+  } catch(e) {}
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Pending Approvals
+// ──────────────────────────────────────────────────────────────────────────
+
+// Build the cost/exposure pill row for a trade
+function costPills(price, size) {
+  const cost = (price * size / 100).toFixed(2);
+  const profit = ((100 - price) * size / 100).toFixed(2);
+  const returnX = price > 0 ? ((100 - price) / price).toFixed(2) : '—';
+  return `<div class="flex gap-2 flex-wrap my-3">
+    <div class="bg-slate-900/70 rounded-lg px-3 py-1.5 border border-slate-700/50 flex items-center gap-2">
+      <span class="text-slate-500 text-xs">Contracts</span>
+      <span class="font-mono font-bold text-white">${size}</span>
+    </div>
+    <div class="bg-slate-900/70 rounded-lg px-3 py-1.5 border border-slate-700/50 flex items-center gap-2">
+      <span class="text-slate-500 text-xs">Total Cost</span>
+      <span class="font-mono font-bold text-white">$${cost}</span>
+    </div>
+    <div class="bg-slate-900/70 rounded-lg px-3 py-1.5 border border-emerald-900/50 flex items-center gap-2">
+      <span class="text-slate-500 text-xs">Max Profit</span>
+      <span class="font-mono font-bold text-emerald-400">+$${profit}</span>
+    </div>
+    <div class="bg-slate-900/70 rounded-lg px-3 py-1.5 border border-slate-700/50 flex items-center gap-2">
+      <span class="text-slate-500 text-xs">Return</span>
+      <span class="font-mono font-bold text-blue-300">${returnX}x</span>
+    </div>
+  </div>`;
+}
+
+async function loadPending() {
+  try {
+    // Load active pending trades
+    const d = await fetch('/api/pending').then(r => r.json());
+    const list = document.getElementById('pending-list');
+
+    if (!d.pending?.length) {
+      list.innerHTML = '<div class="text-center py-8 text-slate-600">No trades pending approval.</div>';
+    } else {
+      list.innerHTML = d.pending.map(p => {
+        const sideCol = p.side === 'YES' ? 'text-emerald-400' : 'text-red-400';
+        const confBadge = { high:'bg-emerald-950 text-emerald-300 border-emerald-800', medium:'bg-amber-950 text-amber-300 border-amber-800', low:'bg-red-950 text-red-300 border-red-800' }[p.confidence] || 'bg-slate-800 text-slate-300 border-slate-600';
+        const sources = (p.sources||[]).map(s =>
+          `<a href="${escHtml(s.url||'')}" target="_blank" class="inline-flex items-center gap-1 text-blue-400 hover:text-blue-300 hover:underline text-xs">📰 ${escHtml(s.title||s.url||'')}</a>`
+        ).join(' · ');
+        return `<div class="bg-slate-800/60 rounded-xl p-5 border border-amber-700/40 mb-4" id="pend-${p.rec_id}" data-market="${escHtml(p.market)}" data-price="${p.price}" data-size="${p.size}">
+          <div class="flex items-start gap-4">
+            <div class="flex-1 min-w-0">
+              <div class="flex items-center gap-3 mb-1 flex-wrap">
+                <span class="font-mono font-bold text-white text-base">${escHtml(p.market)}</span>
+                <span class="text-xl font-bold ${sideCol}">${p.side}</span>
+                <span class="text-slate-400 text-sm">@ ${p.price}¢</span>
+                ${p.edge_bps ? `<span class="text-blue-300 text-sm font-medium">${p.edge_bps}bps edge</span>` : ''}
+                ${p.confidence ? `<span class="px-2 py-0.5 rounded-full text-xs font-bold border ${confBadge}">${p.confidence.toUpperCase()}</span>` : ''}
+              </div>
+              ${costPills(p.price, p.size)}
+              <p class="text-slate-300 text-sm leading-relaxed mb-2">${escHtml(p.thesis||'')}</p>
+              ${p.qa_notes ? `<p class="text-amber-400 text-xs mb-2">⚠ QA: ${escHtml(p.qa_notes)}</p>` : ''}
+              ${sources ? `<div class="flex gap-3 flex-wrap">${sources}</div>` : ''}
+              <div class="text-xs text-slate-700 mt-2 font-mono">${p.rec_id}</div>
+            </div>
+            <div class="flex flex-col gap-2 shrink-0 action-btns" id="btns-${p.rec_id}">
+              <button onclick="approveTrade('${p.rec_id}')"
+                class="px-6 py-2.5 bg-emerald-700 hover:bg-emerald-600 rounded-lg text-sm font-bold transition-colors">
+                ✓ Approve
+              </button>
+              <button onclick="denyTrade('${p.rec_id}')"
+                class="px-6 py-2.5 bg-red-900 hover:bg-red-800 rounded-lg text-sm font-bold transition-colors">
+                ✕ Deny
+              </button>
+            </div>
+          </div>
+        </div>`;
+      }).join('');
+    }
+
+    // Load history of actioned orders
+    loadOrderHistory();
+  } catch(e) { console.error(e); }
+}
+
+async function loadOrderHistory() {
+  try {
+    const d = await fetch('/api/orders?limit=20').then(r => r.json());
+    const wrap = document.getElementById('history-wrap');
+    const list = document.getElementById('history-list');
+    if (!d.orders?.length) { wrap.classList.add('hidden'); return; }
+    wrap.classList.remove('hidden');
+    const statusStyle = {
+      SUBMITTED: 'bg-emerald-900/40 text-emerald-400 border-emerald-800',
+      FILLED: 'bg-emerald-900/60 text-emerald-300 border-emerald-700',
+      APPROVED: 'bg-emerald-900/30 text-emerald-400 border-emerald-900',
+      CANCELLED: 'bg-slate-800/60 text-slate-500 border-slate-700',
+      FAILED: 'bg-red-900/30 text-red-400 border-red-900',
+      PARTIALLY_FILLED: 'bg-amber-900/30 text-amber-400 border-amber-900',
+    };
+    list.innerHTML = d.orders.map(o => {
+      const sideCol = o.side === 'YES' ? 'text-emerald-400' : 'text-red-400';
+      const st = statusStyle[o.status] || 'bg-slate-800 text-slate-400 border-slate-700';
+      const ts = o.updated_at ? new Date(o.updated_at).toLocaleString() : '';
+      const cost = (o.price * o.size / 100).toFixed(2);
+      const canResubmit = o.status === 'APPROVED' || o.status === 'FAILED';
+      const resubmitBtn = canResubmit
+        ? `<button onclick="resubmitTrade('${o.rec_id}')"
+             class="px-2 py-1 bg-blue-900 hover:bg-blue-800 text-blue-300 rounded text-xs font-semibold border border-blue-800 transition-colors">
+             ↺ Resubmit
+           </button>`
+        : '';
+      return `<div class="bg-slate-900/40 rounded-lg px-4 py-3 border border-slate-800/60 flex items-center gap-4 opacity-70 hover:opacity-90 transition-opacity" id="hist-${o.rec_id}">
+        <div class="flex-1 min-w-0">
+          <div class="flex items-center gap-2 flex-wrap">
+            <span class="font-mono text-sm text-slate-300">${escHtml(o.market)}</span>
+            <span class="font-bold text-sm ${sideCol}">${o.side}</span>
+            <span class="text-slate-500 text-xs">${o.size} × ${o.price}¢ = <span class="text-slate-400">$${cost}</span></span>
+          </div>
+          ${o.thesis ? `<p class="text-xs text-slate-600 mt-0.5 truncate">${escHtml(o.thesis)}</p>` : ''}
+        </div>
+        <div class="flex items-center gap-3 shrink-0">
+          <span class="px-2 py-0.5 rounded text-xs font-bold border ${st}" id="hist-status-${o.rec_id}">${o.status}</span>
+          ${resubmitBtn}
+          <span class="text-xs text-slate-600">${ts}</span>
+        </div>
+      </div>`;
+    }).join('');
+  } catch(e) {}
+}
+
+async function approveTrade(recId) {
+  const card = document.getElementById(`pend-${recId}`);
+  const btns = document.getElementById(`btns-${recId}`);
+  if (btns) { btns.innerHTML = '<div class="text-slate-500 text-xs px-2">Processing…</div>'; }
+  try {
+    const r = await fetch(`/api/approve/${recId}`, { method:'POST' }).then(r => r.json());
+    if (r.success) {
+      // Transform card instead of removing — dim it and replace buttons with status
+      if (card) {
+        card.classList.remove('border-amber-700/40');
+        card.classList.add('border-emerald-800/40', 'opacity-60');
+        if (btns) btns.innerHTML = `<div class="flex flex-col items-center gap-1.5">
+          <span class="px-4 py-2 bg-emerald-900/50 text-emerald-400 rounded-lg text-sm font-bold border border-emerald-800">✓ Approved</span>
+          ${r.kalshi_order_id ? `<span class="text-xs text-slate-600 font-mono truncate max-w-[140px]">${r.kalshi_order_id}</span>` : ''}
+        </div>`;
+      }
+      addFeedItem('trade_approved', `Trade approved: ${card?.dataset?.market || recId}`, r.kalshi_order_id || '');
+      loadPerf();
+      loadOrderHistory();
+    } else {
+      if (btns) btns.innerHTML = `<div class="text-red-400 text-xs px-2 max-w-[140px]">${escHtml(r.error||'error')}</div>
+        <button onclick="approveTrade('${recId}')" class="px-4 py-2 bg-emerald-700 hover:bg-emerald-600 rounded-lg text-xs font-bold mt-1">Retry</button>`;
+      alert('Could not approve: ' + (r.error||'unknown error'));
+    }
+  } catch(e) {
+    if (btns) btns.innerHTML = `<button onclick="approveTrade('${recId}')" class="px-4 py-2 bg-emerald-700 hover:bg-emerald-600 rounded-lg text-xs font-bold">Retry</button>`;
+    alert('Error: ' + e.message);
+  }
+}
+
+async function denyTrade(recId) {
+  const reason = prompt('Denial reason (optional):');
+  if (reason === null) return;
+  const card = document.getElementById(`pend-${recId}`);
+  const btns = document.getElementById(`btns-${recId}`);
+  try {
+    const r = await fetch(`/api/deny/${recId}?reason=${encodeURIComponent(reason||'Denied via dashboard')}`, { method:'POST' }).then(r => r.json());
+    if (r.success) {
+      if (card) {
+        card.classList.remove('border-amber-700/40');
+        card.classList.add('border-slate-700/30', 'opacity-50');
+        if (btns) btns.innerHTML = `<div class="flex flex-col items-center gap-1.5">
+          <span class="px-4 py-2 bg-red-900/30 text-red-400 rounded-lg text-sm font-bold border border-red-900">✕ Denied</span>
+          ${reason ? `<span class="text-xs text-slate-600 max-w-[140px] text-center">${escHtml(reason.slice(0,60))}</span>` : ''}
+        </div>`;
+      }
+      addFeedItem('trade_denied', `Trade denied`, reason || '');
+      loadPerf();
+      loadOrderHistory();
+    } else { alert('Could not deny: ' + (r.error||'unknown error')); }
+  } catch(e) { alert('Error: ' + e.message); }
+}
+
+async function resubmitTrade(recId) {
+  const statusEl = document.getElementById(`hist-status-${recId}`);
+  if (statusEl) { statusEl.textContent = 'Submitting…'; statusEl.className = 'px-2 py-0.5 rounded text-xs font-bold border bg-blue-900/40 text-blue-300 border-blue-800'; }
+  try {
+    const resp = await fetch(`/api/resubmit/${recId}`, { method: 'POST' });
+    // Guard against non-JSON error responses (e.g. 500 HTML)
+    const text = await resp.text();
+    let r;
+    try { r = JSON.parse(text); } catch { throw new Error(text.slice(0, 200)); }
+    if (r.success) {
+      if (statusEl) { statusEl.textContent = 'SUBMITTED'; statusEl.className = 'px-2 py-0.5 rounded text-xs font-bold border bg-emerald-900/60 text-emerald-300 border-emerald-700'; }
+      addFeedItem('order_submitted', `Resubmitted: ${r.market}`, r.kalshi_order_id || '', '');
+      loadPerf();
+      if (currentTab === 'overview') loadPortfolio();
+    } else {
+      if (statusEl) { statusEl.textContent = 'APPROVED'; statusEl.className = 'px-2 py-0.5 rounded text-xs font-bold border bg-emerald-900/30 text-emerald-400 border-emerald-900'; }
+      alert('Resubmit failed: ' + (r.error || 'unknown error'));
+    }
+  } catch(e) {
+    if (statusEl) { statusEl.textContent = 'APPROVED'; statusEl.className = 'px-2 py-0.5 rounded text-xs font-bold border bg-emerald-900/30 text-emerald-400 border-emerald-900'; }
+    alert('Resubmit error: ' + e.message);
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Recommendations table
+// ──────────────────────────────────────────────────────────────────────────
+async function loadRecs() {
+  try {
+    const d = await fetch('/api/recommendations?limit=200').then(r => r.json());
+    const tbody = document.getElementById('recs-tbody');
+    if (!d.recommendations?.length) {
+      tbody.innerHTML = '<tr><td colspan="10" class="text-center py-12 text-slate-600">No recommendations yet.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = d.recommendations.map(r => {
+      const ts = (r.created_at||'').slice(0,16).replace('T',' ');
+      const sideCol = r.side === 'YES' ? 'text-emerald-400 font-bold' : 'text-red-400 font-bold';
+      const vm = { APPROVE:'badge-approve', MODIFY:'badge-modify', DENY:'badge-deny' };
+      const confCol = { high:'text-emerald-400', medium:'text-amber-400', low:'text-red-400' };
+      const note = (r.qa_notes || r.thesis || '').slice(0,90);
+      const cost = (r.price && r.size) ? '$' + (r.price * r.size / 100).toFixed(2) : '—';
+      return `<tr class="border-t border-slate-800/60 hover:bg-slate-800/30 transition-colors cursor-pointer" onclick='showRecModal(${JSON.stringify(r)})'>
+        <td class="px-4 py-2.5 text-slate-400 text-xs whitespace-nowrap">${ts}</td>
+        <td class="px-4 py-2.5 font-mono text-xs">${r.market||'—'}</td>
+        <td class="px-4 py-2.5 text-center ${sideCol}">${r.side||'—'}</td>
+        <td class="px-4 py-2.5 text-right tabular-nums">${r.price ? r.price+'¢' : '—'}</td>
+        <td class="px-4 py-2.5 text-right tabular-nums">${r.size||'—'}</td>
+        <td class="px-4 py-2.5 text-right tabular-nums text-slate-400">${cost}</td>
+        <td class="px-4 py-2.5 text-right tabular-nums text-blue-300">${r.edge_bps ? r.edge_bps+'bp' : '—'}</td>
+        <td class="px-4 py-2.5 text-center ${confCol[r.confidence]||'text-slate-400'} uppercase text-xs font-semibold">${(r.confidence||'').slice(0,3)}</td>
+        <td class="px-4 py-2.5 text-center"><span class="px-2 py-0.5 rounded text-xs font-bold ${vm[r.verdict]||'badge-pending'}">${r.verdict||'—'}</span></td>
+        <td class="px-4 py-2.5 text-slate-400 text-xs max-w-xs truncate">${escHtml(note)}</td>
+      </tr>`;
+    }).join('');
+  } catch(e) { console.error(e); }
+}
+
+function showRecModal(r) {
+  const existing = document.getElementById('rec-modal');
+  if (existing) existing.remove();
+  const sources = (r.sources||[]).map(s =>
+    `<a href="${escHtml(s.url||'')}" target="_blank" class="text-blue-400 hover:underline text-sm block truncate">📰 [Tier ${s.trust_tier||s.tier||'?'}] ${escHtml(s.title||s.url||'')}</a>`
+  ).join('');
+  const sideCol = r.side === 'YES' ? 'text-emerald-400' : 'text-red-400';
+  const vm = { APPROVE:'badge-approve', MODIFY:'badge-modify', DENY:'badge-deny' };
+  const cost = (r.price && r.size) ? `$${(r.price * r.size / 100).toFixed(2)}` : '';
+  const profit = (r.price && r.size) ? `+$${((100-r.price) * r.size / 100).toFixed(2)}` : '';
+  const modal = document.createElement('div');
+  modal.id = 'rec-modal';
+  modal.className = 'fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4';
+  modal.onclick = e => { if (e.target === modal) modal.remove(); };
+  modal.innerHTML = `
+    <div class="bg-slate-900 rounded-2xl border border-slate-700 max-w-2xl w-full shadow-2xl overflow-hidden">
+      <div class="flex items-start justify-between px-6 py-4 border-b border-slate-700">
+        <div>
+          <span class="font-mono font-bold text-lg text-white">${escHtml(r.market||'')}</span>
+          <span class="ml-3 text-xl font-bold ${sideCol}">${r.side||''}</span>
+          <span class="ml-2 text-slate-400">@ ${r.price || '?'}¢ × ${r.size || '?'} contracts</span>
+        </div>
+        <button onclick="document.getElementById('rec-modal').remove()" class="text-slate-400 hover:text-white text-xl">✕</button>
+      </div>
+      <div class="px-6 py-4 space-y-3 max-h-[70vh] overflow-y-auto">
+        <div class="flex gap-2 flex-wrap">
+          ${cost ? `<span class="bg-slate-800 rounded px-2 py-1 text-xs text-slate-300">Cost: ${cost}</span>` : ''}
+          ${profit ? `<span class="bg-emerald-950 rounded px-2 py-1 text-xs text-emerald-400">Max profit: ${profit}</span>` : ''}
+          ${r.edge_bps ? `<span class="text-blue-300 text-sm">${r.edge_bps}bps edge</span>` : ''}
+          ${r.confidence ? `<span class="px-2 py-0.5 rounded text-xs font-bold bg-slate-700 text-slate-200">${r.confidence.toUpperCase()}</span>` : ''}
+          ${r.verdict ? `<span class="px-2 py-0.5 rounded text-xs font-bold ${vm[r.verdict]||'badge-pending'}">${r.verdict}</span>` : ''}
+        </div>
+        <div>
+          <div class="text-xs text-slate-500 mb-1 uppercase tracking-wide">Thesis</div>
+          <p class="text-slate-200 text-sm leading-relaxed">${escHtml(r.thesis||'')}</p>
+        </div>
+        ${r.qa_notes ? `<div><div class="text-xs text-slate-500 mb-1 uppercase tracking-wide">QA Notes</div><p class="text-amber-300 text-sm">${escHtml(r.qa_notes)}</p></div>` : ''}
+        ${sources ? `<div><div class="text-xs text-slate-500 mb-1 uppercase tracking-wide">Sources</div><div class="space-y-0.5">${sources}</div></div>` : ''}
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Settings
+// ──────────────────────────────────────────────────────────────────────────
+async function loadSettings() {
+  if (settingsCache) { renderSettings(settingsCache); return; }
+  try {
+    settingsCache = await fetch('/api/settings').then(r => r.json());
+    renderSettings(settingsCache);
+  } catch(e) {
+    document.getElementById('settings-body').innerHTML =
+      `<div class="text-red-400 text-sm py-8 text-center">Failed to load settings: ${escHtml(e.message)}</div>`;
+  }
+}
+
+function inp(id, val, type='number', extra='') {
+  return `<input class="settings-input" id="si-${id}" type="${type}" value="${escHtml(String(val??''))}" ${extra}>`;
+}
+function chk(id, val) {
+  return `<input type="checkbox" id="si-${id}" ${val?'checked':''} class="w-4 h-4 accent-blue-500">`;
+}
+function ta(id, val) {
+  const text = Array.isArray(val) ? val.join('\n') : String(val??'');
+  return `<textarea class="settings-input font-mono" id="si-${id}" rows="4">${escHtml(text)}</textarea>`;
+}
+function field(label, inputHtml, hint='') {
+  return `<div><label class="settings-label">${label}</label>${inputHtml}${hint?`<div class="text-xs text-slate-600 mt-1">${hint}</div>`:''}</div>`;
+}
+function saveBtn(section) {
+  return `<div class="mt-4 flex justify-end">
+    <button onclick="saveSection('${section}')" class="px-5 py-2 bg-blue-700 hover:bg-blue-600 rounded-lg text-sm font-semibold transition-colors">Save ${section.charAt(0).toUpperCase()+section.slice(1)}</button>
+  </div>`;
+}
+
+function renderSettings(cfg) {
+  const r = cfg.risk || {}, u = cfg.universe || {}, rt = cfg.runtime || {};
+  const b = r.bankroll||{}, pt = r.per_trade||{}, pd = r.per_day||{};
+  const conc = r.concentration||{}, liq = r.liquidity_floors||{}, ks = r.kill_switches||{};
+  const rq = r.research_quality||{}, pre = r.preflight||{};
+  const tf = u.time_filters||{}, uCats = u.categories||{};
+  const res = rt.research||{}, notif = rt.notifications||{};
+
+  document.getElementById('settings-body').innerHTML = `
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+
+    <!-- ── Bankroll & Capital ── -->
+    <div class="settings-section">
+      <h3>Bankroll &amp; Capital</h3>
+      <div class="grid grid-cols-2 gap-3">
+        ${field('Total Capital ($)', inp('b-total', b.total_capital_usd, 'number', 'step="0.01" min="0"'))}
+        ${field('Max Deployed ($)', inp('b-deployed', b.max_total_deployed_usd, 'number', 'step="0.01" min="0"'), 'Hard ceiling on open positions')}
+        ${field('Reserve %', inp('b-reserve', b.reserve_pct, 'number', 'step="0.01" min="0" max="1"'), 'Fraction kept in cash (e.g. 0.05)')}
+        ${field('Live Start Capital ($)', inp('b-live', b.live_start_capital_usd, 'number', 'step="0.01" min="0"'))}
+      </div>
+      ${saveBtn('risk')}
+    </div>
+
+    <!-- ── Per-Trade Limits ── -->
+    <div class="settings-section">
+      <h3>Per-Trade Limits</h3>
+      <div class="grid grid-cols-2 gap-3">
+        ${field('Max Loss / Trade ($)', inp('pt-loss', pt.max_loss_usd, 'number', 'step="0.01" min="0"'))}
+        ${field('Max Position % of Bankroll', inp('pt-pct', pt.max_position_pct_of_bankroll, 'number', 'step="0.01" min="0" max="1"'), 'e.g. 0.02 = 2%')}
+        ${field('Max Size (contracts)', inp('pt-size', pt.max_size_contracts, 'number', 'min="1"'))}
+        ${field('Pre-flight Slippage (bps)', inp('pt-slip', pre.max_slippage_bps, 'number', 'min="0"'), 'Abort if price moved > this since QA approval')}
+      </div>
+      ${saveBtn('risk')}
+    </div>
+
+    <!-- ── Daily Limits ── -->
+    <div class="settings-section">
+      <h3>Daily Limits</h3>
+      <div class="grid grid-cols-2 gap-3">
+        ${field('Max Drawdown / Day ($)', inp('pd-dd', pd.max_drawdown_usd, 'number', 'step="0.01" min="0"'))}
+        ${field('Max New Trades / Day', inp('pd-trades', pd.max_new_trades, 'number', 'min="0"'))}
+        ${field('Max Open Exposure ($)', inp('pd-exp', pd.max_open_exposure_usd, 'number', 'step="0.01" min="0"'))}
+      </div>
+      ${saveBtn('risk')}
+    </div>
+
+    <!-- ── Concentration & Kill Switches ── -->
+    <div class="settings-section">
+      <h3>Concentration &amp; Kill Switches</h3>
+      <div class="grid grid-cols-2 gap-3">
+        ${field('Max % per Event', inp('c-ev', conc.max_pct_per_event, 'number', 'step="0.01" min="0" max="1"'))}
+        ${field('Max % per Category', inp('c-cat', conc.max_pct_per_category, 'number', 'step="0.01" min="0" max="1"'))}
+        ${field('Max Correlated Positions', inp('c-cor', conc.max_correlated_positions, 'number', 'min="0"'))}
+        ${field('Consec. Losses → Halt', inp('ks-cl', ks.consecutive_losses_halt, 'number', 'min="1"'))}
+        ${field('Portfolio Drawdown Halt %', inp('ks-dd', ks.portfolio_drawdown_halt_pct, 'number', 'step="0.01" min="0" max="1"'))}
+      </div>
+      ${saveBtn('risk')}
+    </div>
+
+    <!-- ── Liquidity Floors ── -->
+    <div class="settings-section">
+      <h3>Liquidity Floors</h3>
+      <div class="grid grid-cols-2 gap-3">
+        ${field('Min Open Interest (contracts)', inp('lq-oi', liq.min_open_interest, 'number', 'min="0"'))}
+        ${field('Min Daily Volume (contracts)', inp('lq-vol', liq.min_daily_volume_contracts, 'number', 'min="0"'))}
+        ${field('Max Spread (bps)', inp('lq-spr', liq.max_spread_bps, 'number', 'min="0"'))}
+        ${field('Min Edge (bps)', inp('u-edge', u.min_edge_bps, 'number', 'min="0"'), 'Skip candidates below this edge')}
+      </div>
+      ${saveBtn('risk')}
+    </div>
+
+    <!-- ── Research Quality ── -->
+    <div class="settings-section">
+      <h3>Research Quality</h3>
+      <div class="grid grid-cols-2 gap-3">
+        ${field('Max Brier Score', inp('rq-brier', rq.max_brier_score_for_category, 'number', 'step="0.01" min="0" max="1"'), 'Deny category if rolling Brier > this')}
+        ${field('Min Trades before Brier Gate', inp('rq-min', rq.min_trades_before_brier_gate, 'number', 'min="0"'))}
+      </div>
+      ${saveBtn('risk')}
+    </div>
+
+    <!-- ── Market Universe ── -->
+    <div class="settings-section lg:col-span-2">
+      <h3>Market Universe</h3>
+      <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div>
+          ${field('Included Series (one per line)',
+            ta('u-include', uCats.include),
+            'Kalshi series tickers, e.g. KXNBA, KXBTC')}
+        </div>
+        <div>
+          ${field('Excluded Series (one per line)',
+            ta('u-exclude', uCats.exclude),
+            'Specific tickers to never trade')}
+        </div>
+        <div class="grid grid-cols-2 gap-3">
+          ${field('Min Hours to Resolution', inp('u-hours', tf.min_hours_to_resolution, 'number', 'step="0.5" min="0"'))}
+          ${field('Min Edge (bps)', inp('u-edge2', u.min_edge_bps, 'number', 'min="0"'))}
+          ${field('Trading Hours UTC Start', inp('u-tstart', tf.trading_hours_utc_start, 'number', 'min="0" max="23"'))}
+          ${field('Trading Hours UTC End', inp('u-tend', tf.trading_hours_utc_end, 'number', 'min="0" max="23"'))}
+        </div>
+      </div>
+      ${saveBtn('universe')}
+    </div>
+
+    <!-- ── Runtime & Scheduling ── -->
+    <div class="settings-section lg:col-span-2">
+      <h3>Runtime &amp; Scheduling</h3>
+      <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        ${field('Research Interval (min)', inp('rt-interval', res.interval_minutes, 'number', 'min="5"'))}
+        ${field('Max Recs / Run', inp('rt-maxrec', res.max_recommendations_per_run, 'number', 'min="1"'))}
+        ${field('Daily Report UTC Hour', inp('rt-rephour', rt.reporting?.daily_report_utc_hour, 'number', 'min="0" max="23"'))}
+        ${field('Timezone', inp('rt-tz', rt.timezone, 'text'), 'e.g. America/New_York')}
+      </div>
+      <div class="flex items-center gap-6 mt-3">
+        <label class="flex items-center gap-2 cursor-pointer">
+          ${chk('rt-notif-desktop', notif.desktop)}
+          <span class="text-sm text-slate-300">Desktop notifications</span>
+        </label>
+      </div>
+      ${saveBtn('runtime')}
+    </div>
+
+  </div>`;
+}
+
+function collectRisk() {
+  const g = id => { const el = document.getElementById(`si-${id}`); return el ? el.value : null; };
+  const n = id => { const v = g(id); return v !== null && v !== '' ? parseFloat(v) : null; };
+  const ni = id => { const v = g(id); return v !== null && v !== '' ? parseInt(v) : null; };
+  return {
+    bankroll: {
+      total_capital_usd: n('b-total'), reserve_pct: n('b-reserve'),
+      live_start_capital_usd: n('b-live'), max_total_deployed_usd: n('b-deployed'),
+    },
+    per_trade: {
+      max_loss_usd: n('pt-loss'), max_position_pct_of_bankroll: n('pt-pct'),
+      max_size_contracts: ni('pt-size'),
+    },
+    per_day: {
+      max_drawdown_usd: n('pd-dd'), max_new_trades: ni('pd-trades'),
+      max_open_exposure_usd: n('pd-exp'),
+    },
+    concentration: {
+      max_pct_per_event: n('c-ev'), max_pct_per_category: n('c-cat'),
+      max_correlated_positions: ni('c-cor'),
+    },
+    liquidity_floors: {
+      min_open_interest: ni('lq-oi'), min_daily_volume_contracts: ni('lq-vol'),
+      max_spread_bps: ni('lq-spr'),
+    },
+    position_sizing: settingsCache?.risk?.position_sizing || { mode:'fractional_kelly', kelly_fraction:0.25 },
+    kill_switches: {
+      consecutive_losses_halt: ni('ks-cl'), portfolio_drawdown_halt_pct: n('ks-dd'),
+      api_error_rate_halt_per_min: settingsCache?.risk?.kill_switches?.api_error_rate_halt_per_min || 10,
+    },
+    research_quality: {
+      max_brier_score_for_category: n('rq-brier'),
+      min_trades_before_brier_gate: ni('rq-min'),
+    },
+    preflight: { max_slippage_bps: ni('pt-slip') },
+  };
+}
+
+function collectUniverse() {
+  const g = id => { const el = document.getElementById(`si-${id}`); return el ? el.value : ''; };
+  const lines = id => g(id).split('\n').map(s => s.trim()).filter(Boolean);
+  const u = settingsCache?.universe || {};
+  return {
+    categories: { include: lines('u-include'), exclude: lines('u-exclude') },
+    tickers: u.tickers || { explicit_include:[], explicit_exclude:[] },
+    time_filters: {
+      min_hours_to_resolution: parseFloat(g('u-hours')) || 1,
+      trading_hours_utc_start: parseInt(g('u-tstart')) || 0,
+      trading_hours_utc_end: parseInt(g('u-tend')) || 23,
+      trading_days: u.time_filters?.trading_days || [0,1,2,3,4,5],
+    },
+    min_edge_bps: parseInt(g('u-edge2')) || parseInt(g('u-edge')) || 200,
+  };
+}
+
+function collectRuntime() {
+  const g = id => { const el = document.getElementById(`si-${id}`); return el ? el.value : ''; };
+  const rt = settingsCache?.runtime || {};
+  return {
+    research: {
+      interval_minutes: parseInt(g('rt-interval')) || 30,
+      max_recommendations_per_run: parseInt(g('rt-maxrec')) || 5,
+    },
+    reconciliation: rt.reconciliation || { interval_seconds:30 },
+    mark_to_market: rt.mark_to_market || { interval_minutes:5 },
+    reporting: {
+      daily_report_utc_hour: parseInt(g('rt-rephour')) || 23,
+      weekly_report_day: rt.reporting?.weekly_report_day || 6,
+    },
+    notifications: {
+      desktop: document.getElementById('si-rt-notif-desktop')?.checked || false,
+      email_drafts: rt.notifications?.email_drafts || false,
+      quiet_hours_utc_start: rt.notifications?.quiet_hours_utc_start || 3,
+      quiet_hours_utc_end: rt.notifications?.quiet_hours_utc_end || 10,
+    },
+    timezone: g('rt-tz') || 'America/New_York',
+  };
+}
+
+async function saveSection(section) {
+  const alertEl = document.getElementById('settings-alert');
+  alertEl.classList.add('hidden');
+  const body = {};
+  if (section === 'risk') body.risk = collectRisk();
+  else if (section === 'universe') body.universe = collectUniverse();
+  else if (section === 'runtime') body.runtime = collectRuntime();
+
+  try {
+    const r = await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    }).then(r => r.json());
+
+    if (r.success) {
+      settingsCache = null; // clear cache so next load re-reads from file
+      alertEl.textContent = `✓ ${section} settings saved. Changes take effect on the next research cycle.`;
+      alertEl.className = 'mb-4 px-4 py-3 rounded-lg text-sm font-medium bg-emerald-950 text-emerald-300 border border-emerald-800';
+      alertEl.classList.remove('hidden');
+      setTimeout(() => alertEl.classList.add('hidden'), 4000);
+    } else {
+      alertEl.textContent = 'Save failed: ' + (r.errors||[]).join(', ');
+      alertEl.className = 'mb-4 px-4 py-3 rounded-lg text-sm font-medium bg-red-950 text-red-300 border border-red-900';
+      alertEl.classList.remove('hidden');
+    }
+  } catch(e) {
+    alertEl.textContent = 'Save error: ' + e.message;
+    alertEl.className = 'mb-4 px-4 py-3 rounded-lg text-sm font-medium bg-red-950 text-red-300 border border-red-900';
+    alertEl.classList.remove('hidden');
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Live feed
+// ──────────────────────────────────────────────────────────────────────────
+const FEED_ICONS = { new_recommendation:'📊', trade_approved:'✅', trade_denied:'❌', agents_started:'🟢', agents_stopped:'⭕', system_halted:'🛑', system_resumed:'▶️', research_complete:'🔍', system:'⚡', agent_status:'🔄', source:'📰', order_submitted:'🚀' };
+const FEED_BORDERS = { new_recommendation:'border-blue-700/60', trade_approved:'border-emerald-700/60', trade_denied:'border-red-700/60', system_halted:'border-red-700/60', agents_started:'border-emerald-700/60', order_submitted:'border-emerald-600/60', system:'border-blue-600/30' };
+
+function addFeedItem(type, message, detail, ts) {
+  const list = document.getElementById('feed-list');
+  const empty = list.querySelector('.text-slate-600');
+  if (empty) empty.remove();
+  const el = document.createElement('div');
+  el.className = `feed-in bg-slate-800/40 rounded-lg px-4 py-2.5 border-l-2 ${FEED_BORDERS[type]||'border-slate-700/40'}`;
+  el.innerHTML = `<div class="flex gap-3 items-start">
+    <span class="text-base mt-0.5">${FEED_ICONS[type]||'•'}</span>
+    <div class="flex-1 min-w-0">
+      <span class="text-slate-200 text-sm">${escHtml(message)}</span>
+      ${detail ? `<div class="text-slate-500 text-xs mt-0.5 truncate">${escHtml(detail)}</div>` : ''}
+    </div>
+    <span class="text-slate-600 text-xs shrink-0">${ts ? new Date(ts).toLocaleTimeString() : new Date().toLocaleTimeString()}</span>
+  </div>`;
+  list.insertBefore(el, list.firstChild);
+  while (list.children.length > 250) list.removeChild(list.lastChild);
+}
+
+function handleEvent(ev) {
+  if (!ev?.type) return;
+  switch(ev.type) {
+    case 'init':
+      if (ev.agent_statuses) for (const [a,s] of Object.entries(ev.agent_statuses)) setAgentDot(a,s);
+      if (ev.kalshi_connected != null) setKalshiDot(ev.kalshi_connected);
+      (ev.feed||[]).slice().reverse().forEach(e => handleEvent(e));
+      break;
+    case 'agent_status':
+      setAgentDot(ev.agent, ev.status);
+      if (ev.status==='running') addFeedItem('agent_status', `${ev.agent} agent running`, '', ev.ts);
+      if (ev.status==='error')   addFeedItem('agent_status', `⚠ ${ev.agent} agent error: ${ev.error||''}`, '', ev.ts);
+      break;
+    case 'new_recommendation':
+      addFeedItem('new_recommendation', `New rec: ${ev.market} ${ev.side} @ ${ev.price}¢ — ${ev.verdict}`, ev.thesis?.slice(0,120)||'', ev.ts);
+      (ev.sources||[]).forEach(s => addFeedItem('source', `[Tier ${s.tier}] ${s.title}`, s.url, ev.ts));
+      loadPerf();
+      if (currentTab==='recommendations') loadRecs();
+      if (currentTab==='pending') loadPending();
+      break;
+    case 'research_complete':
+      addFeedItem('research_complete', `Research cycle complete — ${ev.rec_count} rec(s) passed QA`, '', ev.ts);
+      loadPerf();
+      break;
+    case 'trade_approved':
+      addFeedItem('trade_approved', `Trade approved: ${ev.market||ev.rec_id}`, '', ev.ts);
+      if (currentTab==='overview') loadPortfolio();
+      break;
+    case 'order_submitted':
+      addFeedItem('order_submitted', `Order submitted: ${ev.market}`, ev.kalshi_order_id||'', ev.ts);
+      if (currentTab==='overview') loadPortfolio();
+      break;
+    case 'trade_denied':
+      addFeedItem('trade_denied', 'Trade denied', ev.reason||'', ev.ts);
+      break;
+    case 'agents_started': addFeedItem('agents_started', 'Trading agents started', '', ev.ts); break;
+    case 'agents_stopped': addFeedItem('agents_stopped', 'Trading agents stopped', '', ev.ts); break;
+    case 'system_halted':  addFeedItem('system_halted', `System halted: ${ev.reason||''}`, '', ev.ts); break;
+    case 'system_resumed': addFeedItem('system_resumed', 'System resumed', '', ev.ts); break;
+    case 'system':         addFeedItem('system', ev.message||'', '', ev.ts); break;
+  }
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// WebSocket
+// ──────────────────────────────────────────────────────────────────────────
+function setWsDot(c) {
+  document.getElementById('dot-ws').className = `dot ${c?'dot-idle':'dot-error'}`;
+  document.getElementById('lbl-ws').textContent = c ? 'live' : 'reconnecting…';
+}
+function initWS() {
+  clearTimeout(wsReconnTimer);
+  if (ws) { try { ws.close(); } catch(e){} }
+  ws = new WebSocket(`ws://${window.location.host}/ws`);
+  ws.onopen = () => setWsDot(true);
+  ws.onclose = () => { setWsDot(false); wsReconnTimer = setTimeout(initWS, 3000); };
+  ws.onerror = () => ws.close();
+  ws.onmessage = e => { try { handleEvent(JSON.parse(e.data)); } catch(err){} };
+}
+setInterval(() => { if (ws?.readyState === WebSocket.OPEN) ws.send('ping'); }, 25000);
+
+// ──────────────────────────────────────────────────────────────────────────
+// Controls
+// ──────────────────────────────────────────────────────────────────────────
+async function toggleMode() {
+  const isAuto = document.getElementById('btn-mode').textContent.includes('AUTO');
+  const next = isAuto ? 'hitl' : 'autonomous';
+  const label = next === 'autonomous'
+    ? 'AUTONOMOUS — trades submit automatically, no approval prompts'
+    : 'HITL — each trade requires manual approval';
+  if (!confirm(`Switch to ${label}?`)) return;
+  try {
+    const resp = await fetch(`/api/mode/${next}`, { method: 'POST' });
+    const text = await resp.text();
+    let r;
+    try { r = JSON.parse(text); } catch { throw new Error(`Server error: ${text.slice(0, 200)}`); }
+    if (r.success) { pollStatus(); }
+    else { alert('Mode change failed: ' + (r.error || 'unknown')); }
+  } catch(e) {
+    alert('Mode change error: ' + e.message);
+  }
+}
+
+async function startAgents() { const r = await fetch('/api/agents/start',{method:'POST'}).then(r=>r.json()); if (!r.success) alert(r.message||'Could not start'); else pollStatus(); }
+async function stopAgents()  { await fetch('/api/agents/stop',{method:'POST'}); pollStatus(); }
+async function runNow()      { const r = await fetch('/api/agents/run-now',{method:'POST'}).then(r=>r.json()); if (!r.success) alert(r.message); }
+async function haltSystem()  { if (!confirm('Halt the trading system?')) return; await fetch('/api/halt',{method:'POST'}); pollStatus(); }
+async function resumeSystem(){ await fetch('/api/resume',{method:'POST'}); pollStatus(); }
+
+async function pollStatus() {
+  try { const s = await fetch('/api/status').then(r=>r.json()); applyStatus(s); } catch(e){}
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Boot
+// ──────────────────────────────────────────────────────────────────────────
+async function init() {
+  initWS();
+  await pollStatus();
+  await loadPerf();
+  await loadPortfolio();
+  setInterval(pollStatus, 15000);
+  setInterval(loadPerf, 30000);
+  setInterval(loadPortfolio, 60000);
+}
+document.addEventListener('DOMContentLoaded', init);
+</script>
+</body>
+</html>

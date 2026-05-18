@@ -1,0 +1,42 @@
+# ── Secrets — never commit these ─────────────────────────────────────────────
+.env
+*.pem
+.kalshi/
+
+# ── Runtime data ──────────────────────────────────────────────────────────────
+data/
+logs/
+metrics/rolling.json
+reports/daily/
+reports/weekly/
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# ── Test / tooling artifacts ──────────────────────────────────────────────────
+.pytest_cache/
+.hypothesis/
+.ruff_cache/
+.coverage
+htmlcov/
+*.log
+
+# ── Editor ────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Misc build artifacts ──────────────────────────────────────────────────────
+=*
