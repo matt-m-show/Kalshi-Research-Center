@@ -1,39 +1,20 @@
-# /approve — Approve a pending HITL trade
+---
+description: Approve a trade waiting in Approval mode (optionally fewer contracts or a lower max price)
+argument-hint: <rec_id> [size] [max_price_cents]
+---
 
-Used in HITL mode to approve a trade that the Execute Agent has queued for your review.
+The dashboard must be running locally (`.\start-web.ps1`). First show the pending trade so the user can confirm what they're approving:
 
-## Usage
-
-```
-/approve <rec_id>
-```
-
-To see all pending trades:
-```
-/pending
+```bash
+curl -s http://127.0.0.1:8000/api/pending
 ```
 
-## What this does
+Summarize the matching trade (market, side, QA size, our bid and max price, edge after fees, thesis, sources). Then, only after the user confirms, approve it with the arguments `$ARGUMENTS` — the first is the rec_id; an optional size and max price may only be lower than what QA approved:
 
-1. Calls `src.execute.hitl.approve(rec_id, ledger)`:
-   - Finds the Order with `status = PENDING_APPROVAL` matching the `rec_id`.
-   - Updates status to `APPROVED`.
-   - Writes audit entry `HITL_APPROVED`.
-2. The Execute Agent's next scheduled pass will pick up the `APPROVED` order and submit it to Kalshi.
-
-## Trade summary
-
-Before approving, Claude will display:
-- Market ticker and side
-- Size and limit price
-- QA notes and any modifications the QA Agent made
-- Worst-case loss
-- Research Agent's thesis (condensed)
-
-## To deny instead
-
-```
-/deny <rec_id> [optional reason]
+```bash
+curl -s -X POST -H "X-Requested-With: kalshi-dashboard" -H "Content-Type: application/json" \
+  -d '{"size": <size or omit>, "max_price": <cents or omit>}' \
+  http://127.0.0.1:8000/api/approve/<rec_id>
 ```
 
-This cancels the pending order without submitting it.
+Report the result. The order is re-quoted against the live book at submission and is never sent above its max price; if pre-flight blocks it, say why.

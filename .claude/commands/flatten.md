@@ -1,26 +1,17 @@
-# /flatten — Cancel all orders and close all positions
+---
+description: Halt, cancel every resting order and sell every position at market
+---
 
-A more aggressive version of /halt that also attempts to close open positions at market-limit prices.
+This is destructive: it sells every position immediately at whatever the market gives, which can lock in losses. Show the current positions first:
 
-## What this does
-
-1. Halts the system (same as /halt).
-2. Calls `src.execute.orders.flatten_all()`:
-   - Cancels all open resting orders via `DELETE /portfolio/orders/{id}`.
-   - For each open position, submits a limit sell at the most aggressive available price (1¢ for YES positions, 99¢ for NO positions — effectively market-limit).
-3. Logs all actions to `data/audit.log`.
-4. Prints a summary: cancelled orders, positions closed, any errors.
-
-## Usage
-
-```
-/flatten [optional reason text]
+```bash
+curl -s http://127.0.0.1:8000/api/portfolio
 ```
 
-## Warning
+Summarize them and ask the user to confirm explicitly. Only then:
 
-This will attempt to exit at whatever the current market price is. In thin markets, fills may be at unfavorable prices. Review your open positions before running.
+```bash
+curl -s -X POST -H "X-Requested-With: kalshi-dashboard" http://127.0.0.1:8000/api/flatten
+```
 
-## After flattening
-
-The system remains HALTED after /flatten. Run `/resume` to restart trading after you've reviewed.
+Report which orders were cancelled, which positions were closed, and any errors. The system is left halted; /resume re-enables it.

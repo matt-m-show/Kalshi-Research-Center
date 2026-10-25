@@ -1,9 +1,35 @@
-# Updated via dashboard — 2026-05-10 12:41 UTC
+# config/runtime.yaml — scheduling, models and API budget.
 research:
-  interval_minutes: 960
-  max_recommendations_per_run: 10
-reconciliation:
-  interval_seconds: 30
+  event_trigger:                  # research markets as they enter their window (cheap check, no LLM)
+    enabled: true
+    check_every_minutes: 30
+    window_hours: [2, 12]         # e.g. games: research 2–12 hours before close
+    window_overrides:             # per-series windows (hours before close)
+      KXFEDDECISION: [6, 72]
+    min_new_markets: 1
+    min_gap_minutes: 60
+  interval_minutes: 960           # full sweep, regardless of windows
+  max_candidates: 12              # markets sent to the research model per run
+  max_recommendations_per_run: 5
+  reassess_after_hours: 12        # don't re-research a market sooner than this
+  max_tool_iterations: 12
+  effort: medium                  # Claude effort level: low | medium | high
+  refusal_fallbacks: true         # if Claude declines a request, Anthropic re-runs it on another model
+  show_market_prices: false       # keep Kalshi prices hidden from the model (independent estimates)
+models:
+  research: claude-sonnet-5-5     # makes the final probability estimate
+  local: qwen3.5:4b               # Ollama model for search planning and summaries (try qwen3:8b)
+local_llm:
+  enabled: true
+  evidence_prepass: true          # local model searches and digests evidence for each event first
+  summarize_pages: true           # local model condenses fetched pages before Claude reads them
+  pool_multiplier: 2              # pre-pass looks at 2× max_candidates, keeps the most promising
+  timeout_seconds: 180
+budget:
+  monthly_usd: 10                 # research is skipped once this month's API spend reaches this
+  per_run_usd: 0.40               # the model is told to wrap up when a run reaches this
+order_management:
+  interval_minutes: 5             # sync fills/settlements, reprice and expire resting orders
 mark_to_market:
   interval_minutes: 5
 reporting:

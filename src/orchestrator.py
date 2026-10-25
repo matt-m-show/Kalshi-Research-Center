@@ -1,728 +1,566 @@
-"""Pipeline orchestrator: Research → QA → Execute.
+"""Research → Pricing → QA → Execute pipeline for one cycle.
 
-Responsibilities:
-  - Load all YAML configs and build runtime objects
-  - Call Research Agent (claude-opus-4-7 with tool use) to generate recommendations
-  - Run the deterministic QA/risk rule engine on each recommendation
-  - Persist artifacts to the ledger
-  - In HITL mode: create PENDING_APPROVAL orders and fire desktop notifications
-  - In paper mode: auto-approve orders without submitting to Kalshi
+  1. Select candidates: in-universe markets that pass time/liquidity filters,
+     aren't already held, and weren't assessed recently. Ranked, capped per
+     series and per event, grouped by event.
+  2. Research: the model records a fair-YES probability per market.
+  3. Price: re-read each orderbook and quote a side/price with edge after fees.
+  4. QA: size to fit every risk cap, run hard gates.
+  5. Act by mode: paper → record only; hitl → queue for approval;
+     autonomous → submit a post-only order.
+
+Every market's path through these stages is recorded on the ResearchRun.
 """
 
 from __future__ import annotations
 
-import asyncio
-import json
 import os
-import re
-import urllib.parse
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Any
+from collections import defaultdict
+from datetime import timedelta
+from typing import Any, Callable
 
-import httpx
-import yaml
-
+from src.common.config import (
+    ConfigError,
+    load_execution_config,
+    load_risk_config,
+    load_runtime_config,
+    load_universe_config,
+)
 from src.common.ledger import Ledger
 from src.common.logging import get_logger
 from src.common.schemas import (
-    Decision,
+    Assessment,
     DecisionVerdict,
     KalshiEnv,
     OperationalMode,
     Order,
     OrderStatus,
     Recommendation,
+    ResearchRun,
+    utcnow,
 )
 from src.execute.hitl import notify_pending_approval
+from src.execute.orders import PreflightError, place_order
+from src.execute.portfolio import build_portfolio_context, event_of
 from src.kalshi_client.client import KalshiClient
-from src.kalshi_client.models import Market, Orderbook
-from src.qa.rules import PortfolioContext, RiskConfig, evaluate
-from src.research.helpers import (
-    in_universe,
-    passes_liquidity_floors,
-    passes_time_to_resolution,
-)
+from src.kalshi_client.models import Market
+from src.qa.pricing import FeeModel, NoQuote, Quote, quote
+from src.qa.rules import PortfolioContext, category_of, evaluate
+from src.research.agent import EventBrief, ResearchAgent, naive_utc
+from src.research.costs import UsageMeter
+from src.research.helpers import in_universe, passes_liquidity_floors, passes_time_to_resolution
 
 log = get_logger("orchestrator")
 
-CONFIG_DIR = Path(__file__).parents[1] / "config"
-AGENT_SPEC_PATH = Path(__file__).parents[1] / ".claude" / "agents" / "research.md"
+MAX_MARKETS_PER_EVENT = 4
+
+EventCallback = Callable[[str, dict], None]
 
 
-# ---------------------------------------------------------------------------
-# Config loaders
-# ---------------------------------------------------------------------------
+class ResearchWindow:
+    """Hours-to-close window for event-triggered research, with per-series overrides."""
 
+    def __init__(self, hours: tuple[float, float], overrides: dict[str, Any] | None = None) -> None:
+        self.hours = (float(hours[0]), float(hours[1]))
+        self.overrides = {k: (float(v[0]), float(v[1])) for k, v in (overrides or {}).items()}
 
-def load_risk_config() -> RiskConfig:
-    cfg = yaml.safe_load((CONFIG_DIR / "risk.yaml").read_text())
-    b = cfg["bankroll"]
-    pt = cfg["per_trade"]
-    pd = cfg["per_day"]
-    conc = cfg["concentration"]
-    liq = cfg["liquidity_floors"]
-    rq = cfg.get("research_quality", {})
-    return RiskConfig(
-        bankroll_cents=int(b["total_capital_usd"] * 100),
-        max_total_deployed_cents=int(b["max_total_deployed_usd"] * 100),
-        max_loss_cents=int(pt["max_loss_usd"] * 100),
-        max_position_pct=pt["max_position_pct_of_bankroll"],
-        max_size_contracts=pt["max_size_contracts"],
-        max_drawdown_cents=int(pd["max_drawdown_usd"] * 100),
-        max_new_trades_per_day=pd["max_new_trades"],
-        max_open_exposure_cents=int(pd["max_open_exposure_usd"] * 100),
-        max_pct_per_event=conc["max_pct_per_event"],
-        max_pct_per_category=conc["max_pct_per_category"],
-        max_correlated_positions=conc["max_correlated_positions"],
-        min_open_interest=liq["min_open_interest"],
-        min_daily_volume=liq["min_daily_volume_contracts"],
-        max_spread_bps=liq["max_spread_bps"],
-        max_price_staleness_bps=cfg.get("preflight", {}).get("max_slippage_bps", 100),
-        max_brier_score=rq.get("max_brier_score_for_category"),
-        min_trades_for_brier_gate=rq.get("min_trades_before_brier_gate", 20),
-    )
+    @classmethod
+    def from_config(cls, trigger_cfg: dict) -> "ResearchWindow":
+        return cls(tuple(trigger_cfg.get("window_hours", [2, 12])), trigger_cfg.get("window_overrides"))
 
+    def bounds(self, series: str) -> tuple[float, float]:
+        return self.overrides.get(series, self.hours)
 
-def load_universe_config() -> dict:
-    return yaml.safe_load((CONFIG_DIR / "universe.yaml").read_text())
+    def contains(self, m: Market) -> bool:
+        if m.close_time is None:
+            return False
+        hours = (naive_utc(m.close_time) - utcnow()).total_seconds() / 3600
+        lo, hi = self.bounds(m.series_ticker)
+        return lo <= hours <= hi
 
-
-def load_runtime_config() -> dict:
-    return yaml.safe_load((CONFIG_DIR / "runtime.yaml").read_text())
-
-
-# ---------------------------------------------------------------------------
-# System prompt builder
-# ---------------------------------------------------------------------------
-
-
-def _build_system_prompt(universe_cfg: dict, risk_cfg: RiskConfig) -> str:
-    """Embed live config into the Research Agent system prompt."""
-    base = AGENT_SPEC_PATH.read_text(encoding="utf-8") if AGENT_SPEC_PATH.exists() else ""
-    # Strip YAML frontmatter (--- ... ---)
-    base = re.sub(r"^---.*?---\n", "", base, flags=re.DOTALL).strip()
-
-    context = f"""
-
-## Runtime Configuration (injected by orchestrator)
-
-- **Universe categories**: {universe_cfg["categories"]["include"]}
-- **Min edge threshold**: {universe_cfg["min_edge_bps"]} bps
-- **Min open interest**: {risk_cfg.min_open_interest} contracts
-- **Min daily volume**: {risk_cfg.min_daily_volume} contracts
-- **Max spread**: {risk_cfg.max_spread_bps} bps
-- **Min hours to resolution**: {universe_cfg["time_filters"]["min_hours_to_resolution"]}
-- **Bankroll**: ${risk_cfg.bankroll_cents / 100:.2f}
-- **Max position pct**: {risk_cfg.max_position_pct * 100:.0f}% of bankroll
-- **Max size**: {risk_cfg.max_size_contracts} contracts
-- **Max loss per trade**: ${risk_cfg.max_loss_cents / 100:.2f}
-"""
-    return base + context
-
-
-# ---------------------------------------------------------------------------
-# Portfolio context builder
-# ---------------------------------------------------------------------------
-
-
-def _build_portfolio_context(ledger: Ledger) -> PortfolioContext:
-    today_str = datetime.utcnow().strftime("%Y-%m-%d")
-    open_orders = ledger.get_orders_by_status(
-        "SUBMITTED", "PARTIALLY_FILLED", "APPROVED", "PENDING_APPROVAL"
-    )
-    deployed = sum(o.limit_price_cents * o.size_contracts for o in open_orders)
-    today_new = sum(
-        1 for o in open_orders
-        if o.submitted_at and o.submitted_at.strftime("%Y-%m-%d") == today_str
-    )
-
-    # Build per-event and per-category exposure maps
-    positions_by_event: dict[str, int] = {}
-    positions_by_category: dict[str, int] = {}
-    for o in open_orders:
-        exposure = o.limit_price_cents * o.size_contracts
-        event = o.market_ticker.rsplit("-", 1)[0] if "-" in o.market_ticker else o.market_ticker
-        category = o.market_ticker.split("-")[0].upper()
-        positions_by_event[event] = positions_by_event.get(event, 0) + exposure
-        positions_by_category[category] = positions_by_category.get(category, 0) + exposure
-
-    return PortfolioContext(
-        current_deployed_cents=deployed,
-        daily_pnl_cents=0,
-        today_new_trades=today_new,
-        open_exposure_cents=deployed,
-        positions_by_event=positions_by_event,
-        positions_by_category=positions_by_category,
-        correlated_count=0,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Tool implementations for the Research Agent
-# ---------------------------------------------------------------------------
-
-
-async def _web_search(query: str, max_results: int = 5) -> str:
-    """Search the web. Uses Tavily API if TAVILY_API_KEY is set (recommended),
-    otherwise falls back to DuckDuckGo HTML scraping."""
-    tavily_key = os.getenv("TAVILY_API_KEY")
-    if tavily_key:
-        return await _tavily_search(query, max_results, tavily_key)
-    return await _ddg_search(query, max_results)
-
-
-async def _tavily_search(query: str, max_results: int, api_key: str) -> str:
-    """Tavily AI search — handles Cloudflare, JS-rendered pages, paywalls."""
-    try:
-        async with httpx.AsyncClient(timeout=20) as client:
-            resp = await client.post(
-                "https://api.tavily.com/search",
-                json={
-                    "api_key": api_key,
-                    "query": query,
-                    "max_results": max_results,
-                    "search_depth": "basic",
-                    "include_answer": True,
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            lines = []
-            if data.get("answer"):
-                lines.append(f"Summary: {data['answer']}\n")
-            for r in data.get("results", [])[:max_results]:
-                lines.append(f"• {r.get('title', '')}: {r.get('content', '')[:300]}")
-                lines.append(f"  URL: {r.get('url', '')}")
-            return "\n".join(lines) if lines else "No results found."
-    except Exception as e:
-        return f"Tavily search error: {e}"
-
-
-async def _ddg_search(query: str, max_results: int) -> str:
-    """DuckDuckGo HTML fallback — may be blocked by anti-bot measures."""
-    try:
-        url = "https://html.duckduckgo.com/html/"
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            resp = await client.get(
-                url,
-                params={"q": query},
-                headers={"User-Agent": "Mozilla/5.0 (compatible; research-bot/1.0)"},
-            )
-            text = resp.text
-            results = re.findall(
-                r'class="result__title"[^>]*>.*?<a[^>]*>(.*?)</a>.*?'
-                r'class="result__snippet"[^>]*>(.*?)</span>',
-                text,
-                re.DOTALL,
-            )
-            if not results:
-                return "Search returned no results (may be blocked). Set TAVILY_API_KEY for reliable search."
-            lines = []
-            for title, snippet in results[:max_results]:
-                title = re.sub(r"<[^>]+>", "", title).strip()
-                snippet = re.sub(r"<[^>]+>", "", snippet).strip()
-                lines.append(f"• {title}: {snippet}")
-            return "\n".join(lines)
-    except Exception as e:
-        return f"Search error: {e}"
-
-
-async def _fetch_url(url: str, max_chars: int = 8000) -> str:
-    """Fetch URL and return plain text (HTML tags stripped)."""
-    try:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-            resp = await client.get(
-                url, headers={"User-Agent": "Mozilla/5.0 (Kalshi research bot)"}
-            )
-            text = re.sub(r"<[^>]+>", " ", resp.text)
-            text = re.sub(r"\s+", " ", text).strip()
-            return text[:max_chars]
-    except Exception as e:
-        return f"Fetch error: {e}"
-
-
-async def _execute_tool(name: str, tool_input: dict) -> str:
-    if name == "web_search":
-        return await _web_search(
-            tool_input["query"], tool_input.get("max_results", 5)
-        )
-    if name == "fetch_url":
-        return await _fetch_url(
-            tool_input["url"], tool_input.get("max_chars", 8000)
-        )
-    return f"Unknown tool: {name}"
-
-
-# ---------------------------------------------------------------------------
-# Recommendation extractor
-# ---------------------------------------------------------------------------
-
-
-def _extract_recommendations(text: str) -> list[Recommendation]:
-    """Parse ```json ... ``` blocks from Claude's response into Recommendation objects."""
-    recs: list[Recommendation] = []
-    for match in re.finditer(r"```json\s*(\{.*?\})\s*```", text, re.DOTALL):
-        try:
-            data = json.loads(match.group(1))
-            rec = Recommendation.model_validate(data)
-            recs.append(rec)
-            log.info("rec_parsed", rec_id=rec.rec_id, market=rec.market_ticker)
-        except Exception as e:
-            log.warning("rec_parse_failed", error=str(e), snippet=match.group(1)[:120])
-    return recs
-
-
-# ---------------------------------------------------------------------------
-# Orchestrator
-# ---------------------------------------------------------------------------
+    def describe(self) -> str:
+        extra = f" ({len(self.overrides)} series overridden)" if self.overrides else ""
+        return f"{self.hours[0]:g}–{self.hours[1]:g}h{extra}"
 
 
 class Orchestrator:
-    """Coordinates the Research → QA → Execute pipeline for one cycle."""
+    def __init__(self, ledger: Ledger | None = None, on_event: EventCallback | None = None) -> None:
+        self.ledger = ledger or Ledger()
+        self.on_event = on_event or (lambda kind, data: None)
+        self._fee_cache: dict[str, FeeModel] = {}
+        self._window: ResearchWindow | None = None
 
-    def __init__(self) -> None:
-        self.ledger = Ledger()
-        self.risk_cfg = load_risk_config()
-        self.universe_cfg = load_universe_config()
-        self.runtime_cfg = load_runtime_config()
-
-    async def run_research_cycle(self) -> list[Recommendation]:
-        """Full Research → QA cycle. Returns recommendations that passed QA."""
-        if self.ledger.is_halted():
-            log.warning("research_skipped_halted")
-            return []
-
-        # Reload configs each cycle so edits to YAML take effect without restart
-        self.risk_cfg = load_risk_config()
-        self.universe_cfg = load_universe_config()
-        self.runtime_cfg = load_runtime_config()
-
-        state = self.ledger.get_system_state()
-        log.info("research_cycle_start", mode=state.mode.value)
-
-        candidates, orderbooks = await self._fetch_candidates()
-        if not candidates:
-            log.info("no_candidates_after_filter")
-            return []
-
-        raw_recs = await self._run_research_agent(candidates, orderbooks)
-        log.info("research_agent_output", raw_count=len(raw_recs))
-
-        approved = await self._run_qa(raw_recs, candidates, orderbooks, state)
-        log.info("research_cycle_complete",
-                 candidates=len(candidates), raw=len(raw_recs), approved=len(approved))
-        return approved
-
-    # ------------------------------------------------------------------
-    # Internal: candidate fetching
-    # ------------------------------------------------------------------
-
-    async def _fetch_candidates(
-        self, verbose: bool = False
-    ) -> tuple[list[Market], dict[str, Orderbook]]:
-        include = self.universe_cfg["categories"]["include"]
-        exclude = (self.universe_cfg["categories"].get("exclude") or [])
-        min_hours = self.universe_cfg["time_filters"]["min_hours_to_resolution"]
-        max_per_run = self.runtime_cfg["research"].get("max_recommendations_per_run", 5)
-
-        async with KalshiClient() as client:
-            try:
-                # Fetch markets per series — bulk fetch only returns combo markets
-                markets: list = []
-                for series in include:
-                    try:
-                        batch = await client.get_markets(series_ticker=series, limit=50)
-                        markets.extend(batch)
-                    except Exception as e:
-                        log.warning("series_fetch_failed", series=series, error=str(e))
-            except Exception as e:
-                log.error("fetch_markets_failed", error=str(e))
-                return [], {}
-
-            log.info("markets_fetched", total=len(markets))
-
-            # Rejection tally for diagnostics
-            rejected: dict[str, int] = {
-                "universe": 0, "time_to_resolution": 0, "liquidity": 0
-            }
-
-            candidates: list[Market] = []
-            for m in markets:
-                if not in_universe(m.ticker, include, exclude):
-                    rejected["universe"] += 1
-                    if verbose:
-                        log.debug("rejected_universe", ticker=m.ticker)
-                    continue
-
-                ok, reason = passes_time_to_resolution(m, min_hours)
-                if not ok:
-                    rejected["time_to_resolution"] += 1
-                    if verbose:
-                        log.debug("rejected_time", ticker=m.ticker, reason=reason)
-                    continue
-
-                ok, reason = passes_liquidity_floors(
-                    m,
-                    self.risk_cfg.min_open_interest,
-                    self.risk_cfg.min_daily_volume,
-                    self.risk_cfg.max_spread_bps,
-                )
-                if not ok:
-                    rejected["liquidity"] += 1
-                    if verbose:
-                        log.debug("rejected_liquidity", ticker=m.ticker, reason=reason,
-                                  oi=m.open_interest, vol=m.volume)
-                    continue
-
-                candidates.append(m)
-
-            log.info(
-                "filter_summary",
-                total_fetched=len(markets),
-                passed=len(candidates),
-                rejected_universe=rejected["universe"],
-                rejected_time=rejected["time_to_resolution"],
-                rejected_liquidity=rejected["liquidity"],
-            )
-
-            # Skip tickers already analyzed in the last 6 hours — no need to
-            # re-spend credits on a market Claude already evaluated this cycle.
-            recent = self.ledger.get_recently_analyzed_tickers(hours=6.0)
-            if recent:
-                before = len(candidates)
-                candidates = [c for c in candidates if c.ticker not in recent]
-                skipped = before - len(candidates)
-                if skipped:
-                    log.info("skipped_recently_analyzed", count=skipped, ttl_hours=6.0)
-
-            # Rank by a simple edge-potential score:
-            #   volume × (1 + price_extremity)
-            # High volume = actively traded / newsworthy.
-            # Extreme price (far from 50¢) = more room for mispricing.
-            def _edge_score(m: Market) -> float:
-                mid = (m.yes_bid + m.yes_ask) / 2 if m.yes_ask > 0 else 50
-                extremity = abs(mid - 50) / 50  # 0 at 50¢, 1 at 0¢ or 100¢
-                return m.volume * (1 + extremity)
-
-            # Stratified cap: each configured series gets at most an equal share
-            # of the candidate slots.  Without this, high-volume sports markets
-            # (NBA/NHL playoffs) crowd out lower-volume but valid categories like
-            # KXBTC or KXFED that the user explicitly included.
-            total_slots = max_per_run * 2
-            num_series = max(len(include), 1)
-            per_series_cap = max(2, -(-total_slots // num_series))  # ceiling division
-
-            by_series: dict[str, list[Market]] = {}
-            for m in sorted(candidates, key=_edge_score, reverse=True):
-                series_key = next(
-                    (s for s in include if m.ticker.upper().startswith(s.upper())),
-                    "OTHER",
-                )
-                bucket = by_series.setdefault(series_key, [])
-                if len(bucket) < per_series_cap:
-                    bucket.append(m)
-
-            # Re-sort the stratified set globally, then cap at total_slots
-            candidates = sorted(
-                [m for bucket in by_series.values() for m in bucket],
-                key=_edge_score,
-                reverse=True,
-            )[:total_slots]
-
-            log.info(
-                "candidate_breakdown",
-                **{s: len(b) for s, b in by_series.items()},
-            )
-
-            orderbooks: dict[str, Orderbook] = {}
-            for m in candidates[:25]:
-                try:
-                    orderbooks[m.ticker] = await client.get_orderbook(m.ticker)
-                except Exception:
-                    pass
-
-        return candidates, orderbooks
-
-    # ------------------------------------------------------------------
-    # Internal: Research Agent call
-    # ------------------------------------------------------------------
-
-    async def _run_research_agent(
-        self, candidates: list[Market], orderbooks: dict[str, Orderbook]
-    ) -> list[Recommendation]:
-        import anthropic
-
-        system_prompt = _build_system_prompt(self.universe_cfg, self.risk_cfg)
-        max_recs = self.runtime_cfg["research"].get("max_recommendations_per_run", 5)
-
-        def _market_price_data(m: Market) -> dict:
-            ob = orderbooks.get(m.ticker)
-            best_bid = ob.best_yes_bid() if ob else None
-            best_ask = ob.best_yes_ask() if ob else None
-            mid = ob.mid_price() if ob else None
-            # Compute no_ask for convenience (price to buy NO contracts)
-            no_ask = (100 - best_bid) if best_bid is not None else None
-            return {
-                "ticker": m.ticker,
-                "title": m.title,
-                "yes_bid": best_bid,       # best price to sell YES (buy NO)
-                "yes_ask": best_ask,       # best price to buy YES
-                "no_ask": no_ask,          # best price to buy NO = 100 - yes_bid
-                "mid_price": round(mid, 1) if mid is not None else None,
-                "open_interest": m.open_interest,
-                "volume": m.volume,
-                "close_time": m.close_time.isoformat() if m.close_time else None,
-            }
-
-        market_summary = json.dumps(
-            [_market_price_data(m) for m in candidates],
-            indent=2,
-        )
-
-        user_msg = (
-            f"Today is {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}.\n\n"
-            f"In-universe markets passing liquidity floors (includes live bid/ask/mid prices):\n\n"
-            f"```json\n{market_summary}\n```\n\n"
-            f"Research the most promising markets, form independent probability estimates "
-            f"(before looking at the bid/ask), and output up to {max_recs} recommendations "
-            f"as JSON objects wrapped in ```json ... ``` code fences. "
-            f"Use web_search and fetch_url to gather supporting evidence. "
-            f"Skip any market with edge < {self.universe_cfg['min_edge_bps']} bps.\n\n"
-            f"IMPORTANT — Set limit_price_cents to yes_ask + 1 (for YES buys) or "
-            f"no_ask + 1 (for NO buys). Do NOT set it to your estimated fair probability × 100. "
-            f"The QA system will reject any limit price that differs from the current mid by more than 5%."
-        )
-
-        tools = [
-            {
-                "name": "web_search",
-                "description": "Search the web for news and information about a topic.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "query": {"type": "string"},
-                        "max_results": {"type": "integer", "default": 5},
-                    },
-                    "required": ["query"],
-                },
-            },
-            {
-                "name": "fetch_url",
-                "description": "Fetch the text content of a URL.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "url": {"type": "string"},
-                        "max_chars": {"type": "integer", "default": 8000},
-                    },
-                    "required": ["url"],
-                },
-            },
-        ]
-
-        client = anthropic.AsyncAnthropic()
-        messages: list[dict] = [{"role": "user", "content": user_msg}]
-        recommendations: list[Recommendation] = []
-
-        for iteration in range(25):  # hard cap on tool-use iterations
-            async with client.messages.stream(
-                model="claude-sonnet-4-6",
-                max_tokens=16000,
-                system=[
-                    {
-                        "type": "text",
-                        "text": system_prompt,
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
-                tools=tools,
-                messages=messages,
-            ) as stream:
-                response = await stream.get_final_message()
-
-            messages.append({"role": "assistant", "content": response.content})
-
-            # Log Claude's raw text response for debugging
-            for block in response.content:
-                if hasattr(block, "text") and block.text.strip():
-                    log.info("claude_response_text", iteration=iteration,
-                             stop_reason=response.stop_reason,
-                             text_preview=block.text[:500])
-
-            # Parse any recommendations from text blocks
-            for block in response.content:
-                if hasattr(block, "text"):
-                    recommendations.extend(_extract_recommendations(block.text))
-
-            if response.stop_reason == "end_turn":
-                break
-
-            if response.stop_reason == "max_tokens":
-                # Response was truncated — ask Claude to finish and output recommendations
-                log.warning("claude_max_tokens", iteration=iteration)
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "Your response was cut off. Please output any remaining "
-                        "recommendations now as ```json ... ``` code fences, "
-                        "then finish with end_turn."
-                    ),
-                })
-                continue
-
-            if response.stop_reason == "tool_use":
-                tool_results = []
-                for block in response.content:
-                    if block.type == "tool_use":
-                        result = await _execute_tool(block.name, block.input)
-                        tool_results.append(
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": block.id,
-                                "content": result,
-                            }
-                        )
-                messages.append({"role": "user", "content": tool_results})
-
-        return recommendations[:max_recs]
-
-    # ------------------------------------------------------------------
-    # Internal: QA pass
-    # ------------------------------------------------------------------
-
-    async def _run_qa(
-        self,
-        recs: list[Recommendation],
-        candidates: list[Market],
-        orderbooks: dict[str, Orderbook],
-        state,
-    ) -> list[Recommendation]:
-        ctx = _build_portfolio_context(self.ledger)
-        approved: list[Recommendation] = []
-
-        async with KalshiClient() as client:
-            for rec in recs:
-                try:
-                    ob = orderbooks.get(rec.market_ticker)
-                    if ob is None:
-                        try:
-                            ob = await client.get_orderbook(rec.market_ticker)
-                        except Exception as e:
-                            log.warning("orderbook_fetch_failed",
-                                        ticker=rec.market_ticker, error=str(e))
-                            continue
-
-                    market_data = {
-                        "open_interest": next(
-                            (m.open_interest for m in candidates
-                             if m.ticker == rec.market_ticker), 0
-                        ),
-                        "volume": next(
-                            (m.volume for m in candidates
-                             if m.ticker == rec.market_ticker), 0
-                        ),
-                    }
-
-                    decision = evaluate(rec, self.risk_cfg, ctx, ob, market_data)
-                    self.ledger.save_recommendation(rec)
-                    self.ledger.save_decision(decision)
-
-                    log.info(
-                        "qa_decision",
-                        rec_id=rec.rec_id,
-                        verdict=decision.decision.value,
-                        market=rec.market_ticker,
-                        notes=decision.qa_notes,
-                    )
-
-                    if decision.decision in (DecisionVerdict.APPROVE, DecisionVerdict.MODIFY):
-                        approved.append(rec)
-                        if state.mode == OperationalMode.AUTONOMOUS:
-                            # place_order handles the full ledger lifecycle (APPROVED → SUBMITTED/FAILED)
-                            # so _create_order is not called — it would create a duplicate stuck APPROVED record
-                            await self._submit_autonomous(rec, decision, client)
-                        else:
-                            # HITL: creates PENDING_APPROVAL + desktop notification
-                            # PAPER: creates APPROVED record without touching Kalshi
-                            self._create_order(rec, decision, state.mode)
-
-                except Exception as e:
-                    log.error("qa_failed", rec_id=rec.rec_id, error=str(e))
-
-        return approved
-
-    async def _submit_autonomous(
-        self, rec: Recommendation, decision: Decision, client: KalshiClient
-    ) -> None:
-        """Submit an order directly to Kalshi in AUTONOMOUS mode (no HITL gate).
-
-        place_order() handles the full ledger lifecycle:
-          APPROVED → SUBMITTED on success, FAILED on error.
-        """
-        from datetime import timedelta
-
-        from src.common.schemas import ApprovedOrder
-        from src.execute.orders import place_order
-
-        if decision.approved_order is None:
-            log.warning("autonomous_skip_no_order", rec_id=rec.rec_id)
-            return
-        ao = decision.approved_order
+    async def count_window_markets(self, window: ResearchWindow) -> int:
+        """Eligible, not-recently-assessed markets inside ``window`` (no LLM, no run record)."""
+        risk_cfg, universe = load_risk_config(), load_universe_config()
+        research_cfg = load_runtime_config()["research"]
+        scratch = ResearchRun(trigger="window-check")
+        self._window = window
         try:
-            expiry = datetime.now(timezone.utc) + timedelta(hours=4)
-            approved_order = ApprovedOrder(
-                market_ticker=ao.market_ticker,
-                side=ao.side,
-                order_type=ao.order_type,
-                limit_price_cents=ao.limit_price_cents,
-                size_contracts=ao.size_contracts,
-                client_order_id=ao.client_order_id,
-                expiry_ts=expiry,
-            )
-            submitted = await place_order(approved_order, rec.rec_id, client, self.ledger)
-            log.info(
-                "autonomous_order_submitted",
-                rec_id=rec.rec_id,
-                market=rec.market_ticker,
-                side=rec.side.value,
-                price=ao.limit_price_cents,
-                size=ao.size_contracts,
-                kalshi_order_id=submitted.kalshi_order_id,
-            )
-        except ValueError as e:
-            # Pre-flight rejection — expected, not a system error
-            log.warning("autonomous_preflight_blocked", rec_id=rec.rec_id,
-                        market=rec.market_ticker, reason=str(e))
+            async with KalshiClient() as client:
+                ctx = await build_portfolio_context(self.ledger, client)
+                events = await self._select(client, scratch, ctx, universe, risk_cfg, research_cfg,
+                                            pool_limit=10_000, probe=True)
+        finally:
+            self._window = None
+        return sum(len(ev.markets) for ev in events)
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+
+    async def run_research_cycle(self, trigger: str = "manual",
+                                 window: "ResearchWindow | None" = None) -> ResearchRun:
+        """Run one cycle. ``window`` restricts candidates to markets closing within it."""
+        state = self.ledger.get_system_state()
+        run = ResearchRun(trigger=trigger, mode=state.mode.value)
+        if window:
+            run.notes.append(f"Event trigger: markets closing in {window.describe()}")
+        self.ledger.save_run(run)
+        self.on_event("run_started", {"run_id": run.run_id, "trigger": trigger})
+        self._window = window
+        try:
+            await self._run(run, state.mode)
+            if run.status == "running":
+                run.status = "ok"
+        except ConfigError as e:
+            run.status, run.error = "error", f"Config: {e}"
         except Exception as e:
-            log.error("autonomous_order_failed", rec_id=rec.rec_id,
-                      market=rec.market_ticker, error=str(e))
+            log.error("research_cycle_failed", run_id=run.run_id, error=str(e))
+            run.status, run.error = "error", str(e)[:1000]
+        finally:
+            self._window = None
+            run.finished_at = utcnow()
+            self.ledger.save_run(run)
+            self.on_event("run_finished", {
+                "run_id": run.run_id, "status": run.status, "error": run.error,
+                "assessments": run.assessments, "recommendations": run.recommendations,
+                "approved": run.approved, "submitted": run.submitted,
+                "cost_usd": round(run.cost_usd, 4),
+            })
+        return run
 
-    def _create_order(
-        self, rec: Recommendation, decision: Decision, mode: OperationalMode
-    ) -> None:
-        if decision.approved_order is None:
+    # ------------------------------------------------------------------
+    # Pipeline
+    # ------------------------------------------------------------------
+
+    async def _run(self, run: ResearchRun, mode: OperationalMode) -> None:
+        if self.ledger.is_halted():
+            run.status, run.notes = "skipped", ["System is halted"]
             return
-        ao = decision.approved_order
 
-        if mode == OperationalMode.HITL:
-            status = OrderStatus.PENDING_APPROVAL
-        else:
-            # Paper mode: record approval without touching Kalshi
-            status = OrderStatus.APPROVED
+        risk_cfg = load_risk_config()
+        exec_cfg = load_execution_config()
+        universe = load_universe_config()
+        runtime = load_runtime_config()
+        research_cfg = runtime["research"]
+        budget = runtime.get("budget") or {}
+
+        month_start = utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        spent = self.ledger.api_spend_since(month_start)
+        monthly_cap = float(budget.get("monthly_usd", 10.0))
+        if spent >= monthly_cap:
+            run.status = "skipped"
+            run.notes.append(f"Monthly API budget used: ${spent:.2f} of ${monthly_cap:.2f}")
+            return
+
+        model = runtime["models"]["research"]
+        run.model = model
+        meter = UsageMeter(runtime.get("model_pricing"))
+
+        local_cfg = runtime.get("local_llm") or {}
+        assist = await self._local_assist(runtime, run) if local_cfg.get("enabled") else None
+        limit = int(research_cfg["max_candidates"])
+        pool = limit * int(local_cfg.get("pool_multiplier", 2)) \
+            if assist and local_cfg.get("evidence_prepass") else limit
+
+        async with KalshiClient() as client:
+            ctx = await build_portfolio_context(self.ledger, client)
+            events = await self._select(client, run, ctx, universe, risk_cfg, research_cfg, pool)
+            self.ledger.save_run(run)
+            if events and assist and local_cfg.get("evidence_prepass"):
+                events = await self._prepass(assist, events, run, limit)
+            else:
+                events = self._take(events, run, limit)
+            self.ledger.save_run(run)
+            if not events:
+                run.notes.append("No candidates passed the filters")
+                self._add_local_usage(meter, assist, run)
+                return
+
+            per_run_cap = min(float(budget.get("per_run_usd", 0.40)), monthly_cap - spent)
+            focus = "\n".join(f"- {m.title}" for ev in events for m in ev.markets)
+            agent = ResearchAgent(
+                model=model, meter=meter,
+                max_iterations=int(research_cfg["max_tool_iterations"]),
+                max_cost_usd=per_run_cap,
+                effort=research_cfg.get("effort", "medium"),
+                fetch_hook=assist.page_hook(focus) if assist and local_cfg.get("summarize_pages") else None,
+                refusal_fallbacks=bool(research_cfg.get("refusal_fallbacks", True)),
+            )
+            try:
+                assessments, skips = await agent.run(
+                    events, run.run_id, show_prices=bool(research_cfg.get("show_market_prices"))
+                )
+            finally:
+                self._add_local_usage(meter, assist, run)
+                run.notes.extend(agent.notes)
+            markets = {m.ticker: m for ev in events for m in ev.markets}
+            self._record_assessments(run, assessments, skips, markets)
+
+            recs = await self._price(client, run, assessments, markets, exec_cfg)
+            recs.sort(key=lambda r: r.edge_cents_after_fees or 0, reverse=True)
+            cap = int(research_cfg["max_recommendations_per_run"])
+            for extra in recs[cap:]:
+                self._stage(run, extra.market_ticker, "not_traded", f"beyond the {cap}-per-run cap")
+            for rec in recs[:cap]:
+                await self._qa_and_act(client, run, rec, markets[rec.market_ticker],
+                                       ctx, risk_cfg, exec_cfg, mode)
+
+    # ------------------------------------------------------------------
+    # 1. Candidate selection
+    # ------------------------------------------------------------------
+
+    async def _select(self, client: KalshiClient, run: ResearchRun, ctx: PortfolioContext,
+                      universe: dict, risk_cfg: Any, research_cfg: dict,
+                      pool_limit: int, probe: bool = False) -> list[EventBrief]:
+        """Filter and rank markets; return up to ``pool_limit`` of them grouped by event,
+        best-ranked event first. ``probe`` skips orderbooks and feed events."""
+        include = universe["categories"]["include"]
+        exclude = universe["categories"].get("exclude") or []
+        tf = universe.get("time_filters") or {}
+        min_hours = float(tf.get("min_hours_to_resolution", 1))
+        max_days = tf.get("max_days_to_resolution")
+        recent = self.ledger.recently_assessed_tickers(float(research_cfg["reassess_after_hours"]))
+
+        markets: list[Market] = []
+        for series in include:
+            try:
+                markets.extend(await client.get_markets(series_ticker=series, status="open", limit=200))
+            except Exception as e:
+                run.notes.append(f"Couldn't fetch series {series}: {e}")
+
+        eligible: list[Market] = []
+        for m in markets:
+            reason = None
+            if not in_universe(m.ticker, include, exclude):
+                reason = "excluded by universe"
+            elif not (ok := passes_time_to_resolution(m, min_hours))[0]:
+                reason = ok[1]
+            elif max_days is not None and m.close_time and \
+                    naive_utc(m.close_time) > utcnow() + timedelta(days=float(max_days)):
+                reason = f"resolves more than {max_days} days out"
+            elif not (ok := passes_liquidity_floors(m, risk_cfg.min_open_interest,
+                                                     risk_cfg.min_daily_volume, 10**9))[0]:
+                reason = ok[1]
+            elif m.ticker in ctx.held_tickers:
+                reason = "already holding or bidding"
+            elif m.ticker in recent:
+                reason = f"assessed in the last {research_cfg['reassess_after_hours']}h"
+            elif self._window is not None and not self._window.contains(m):
+                lo, hi = self._window.bounds(m.series_ticker)
+                reason = f"outside the {lo:g}–{hi:g}h research window"
+            run.candidates.append(self._entry(m, "filtered" if reason else "eligible", reason or ""))
+            if not reason:
+                eligible.append(m)
+
+        def score(m: Market) -> float:
+            mid = (m.yes_bid + m.yes_ask) / 2 if m.yes_ask else 50
+            return (m.volume_24h or m.volume) * (1 + abs(mid - 50) / 50)
+
+        per_series_cap = max(2, -(-pool_limit // max(len(include), 1)))
+        per_series: dict[str, int] = defaultdict(int)
+        per_event: dict[str, int] = defaultdict(int)
+        chosen: list[Market] = []
+        for m in sorted(eligible, key=score, reverse=True):
+            series, event = m.series_ticker, m.event_ticker or event_of(m.ticker)
+            if (len(chosen) < pool_limit and per_series[series] < per_series_cap
+                    and per_event[event] < MAX_MARKETS_PER_EVENT):
+                chosen.append(m)
+                per_series[series] += 1
+                per_event[event] += 1
+                self._stage(run, m.ticker, "shortlisted", "")
+            else:
+                self._stage(run, m.ticker, "not_selected", "ranked below the candidate cap")
+
+        by_event: dict[str, list[Market]] = defaultdict(list)   # insertion order = rank order
+        for m in chosen:
+            by_event[m.event_ticker or event_of(m.ticker)].append(m)
+        events = [EventBrief(event_ticker=e, markets=ms) for e, ms in by_event.items()]
+
+        if probe:
+            return events
+        if research_cfg.get("show_market_prices"):
+            for ev in events:
+                for m in ev.markets:
+                    try:
+                        ev.orderbooks[m.ticker] = await client.get_orderbook(m.ticker)
+                    except Exception:
+                        pass
+
+        self.on_event("candidates_selected", {
+            "run_id": run.run_id, "fetched": len(markets), "eligible": len(eligible),
+            "selected": len(chosen), "events": len(events),
+        })
+        return events
+
+    # ------------------------------------------------------------------
+    # 1b. Final pick (optionally after the local evidence pre-pass)
+    # ------------------------------------------------------------------
+
+    def _take(self, events: list[EventBrief], run: ResearchRun, limit: int) -> list[EventBrief]:
+        """Keep whole events in order until ``limit`` markets are chosen."""
+        out: list[EventBrief] = []
+        count = 0
+        for ev in events:
+            if count + len(ev.markets) > limit and out:
+                for m in ev.markets:
+                    self._stage(run, m.ticker, "not_selected", "ranked below the candidate cap")
+                continue
+            out.append(ev)
+            count += len(ev.markets)
+            for m in ev.markets:
+                self._stage(run, m.ticker, "selected",
+                            f"local priority {ev.priority}" if ev.priority else "")
+        return out
+
+    async def _local_assist(self, runtime: dict, run: ResearchRun):
+        from src.llm.ollama import OllamaClient
+        from src.research.local_assist import LocalAssist
+
+        cfg = runtime.get("local_llm") or {}
+        model = runtime["models"].get("local", "qwen3.5:4b")
+        assist = LocalAssist(OllamaClient(model, host=cfg.get("host"),
+                                          timeout=float(cfg.get("timeout_seconds", 180)),
+                                          num_ctx=int(cfg.get("num_ctx", 16384))))
+        if await assist.start():
+            run.notes.append(f"Local model {model} assisting")
+            return assist
+        run.notes.append(f"Local model unavailable — Claude-only run ({assist.detail})")
+        return None
+
+    async def _prepass(self, assist: Any, events: list[EventBrief], run: ResearchRun,
+                       limit: int) -> list[EventBrief]:
+        """Gather evidence for each shortlisted event locally, then keep the most promising."""
+        today = utcnow().strftime("%Y-%m-%d")
+        for ev in events:   # sequential: one GPU, and it keeps the model warm
+            evidence = await assist.gather(ev, today)
+            if evidence is None:
+                continue
+            ev.evidence, ev.priority = evidence.as_text(), evidence.priority
+            for m in ev.markets:
+                self._stage(run, m.ticker, "shortlisted", evidence.reason,
+                            local_priority=evidence.priority, local_queries=evidence.queries)
+            self.on_event("evidence", {"run_id": run.run_id, "event": ev.event_ticker,
+                                       "priority": evidence.priority, "facts": len(evidence.facts)})
+        dropped = [ev for ev in events if ev.priority == 1]
+        for ev in dropped:
+            for m in ev.markets:
+                self._stage(run, m.ticker, "triaged_out", "local pre-pass found nothing useful")
+        keep = [ev for ev in events if ev.priority != 1]
+        # Stable sort: priority first, original rank second (unknown priority ranks as 3)
+        keep.sort(key=lambda ev: -(ev.priority or 3))
+        return self._take(keep, run, limit)
+
+    @staticmethod
+    def _add_local_usage(meter: UsageMeter, assist: Any, run: ResearchRun) -> None:
+        if assist is not None and assist.client.calls:
+            meter.add_local(assist.client.model, assist.client.prompt_tokens,
+                            assist.client.output_tokens)
+        run.usage, run.cost_usd = meter.as_dict(), meter.total_cost
+
+    @staticmethod
+    def _entry(m: Market, stage: str, reason: str) -> dict:
+        return {"ticker": m.ticker, "title": m.title, "event": m.event_ticker,
+                "series": m.series_ticker, "stage": stage, "reason": reason}
+
+    @staticmethod
+    def _stage(run: ResearchRun, ticker: str, stage: str, reason: str, **extra: Any) -> None:
+        for c in run.candidates:
+            if c["ticker"] == ticker:
+                c.update(stage=stage, reason=reason, **extra)
+                return
+
+    # ------------------------------------------------------------------
+    # 2. Record assessments
+    # ------------------------------------------------------------------
+
+    def _record_assessments(self, run: ResearchRun, assessments: list[Assessment],
+                            skips: dict[str, str], markets: dict[str, Market]) -> None:
+        for a in assessments:
+            self.ledger.save_assessment(a)
+            self._stage(run, a.market_ticker, "assessed", "", fair_yes_prob=a.fair_yes_prob,
+                        confidence=a.confidence.value)
+            self.on_event("assessment", {
+                "run_id": run.run_id, "ticker": a.market_ticker, "title": a.title,
+                "fair_yes_prob": a.fair_yes_prob, "confidence": a.confidence.value,
+                "thesis": a.thesis[:240],
+            })
+        for ticker, reason in skips.items():
+            self._stage(run, ticker, "skipped", reason)
+            if reason.startswith("not assessed"):
+                continue  # ran out of turns/budget — eligible again next run
+            m = markets[ticker]
+            self.ledger.save_assessment(Assessment(
+                run_id=run.run_id, market_ticker=ticker, event_ticker=m.event_ticker,
+                series_ticker=m.series_ticker, title=m.title, skip_reason=reason,
+                model=run.model, market_close_time=naive_utc(m.close_time),
+            ))
+        run.assessments = len(assessments)
+
+    # ------------------------------------------------------------------
+    # 3. Pricing
+    # ------------------------------------------------------------------
+
+    async def _fee_model(self, client: KalshiClient, series: str) -> FeeModel:
+        if series not in self._fee_cache:
+            try:
+                s = await client.get_series(series)
+                self._fee_cache[series] = FeeModel(s.fee_type, s.fee_multiplier)
+            except Exception:
+                self._fee_cache[series] = FeeModel()   # assume standard quadratic fees
+        return self._fee_cache[series]
+
+    async def _price(self, client: KalshiClient, run: ResearchRun, assessments: list[Assessment],
+                     markets: dict[str, Market], exec_cfg: Any) -> list[Recommendation]:
+        recs: list[Recommendation] = []
+        for a in assessments:
+            m = markets[a.market_ticker]
+            try:
+                ob = await client.get_orderbook(a.market_ticker)
+            except Exception as e:
+                self._stage(run, a.market_ticker, "no_edge", f"orderbook unavailable: {e}")
+                continue
+            a.yes_bid, a.yes_ask = ob.best_yes_bid(), ob.best_yes_ask()
+            self.ledger.save_assessment(a)
+            fees = await self._fee_model(client, m.series_ticker)
+            q = quote(a.fair_yes_prob, ob, exec_cfg.min_edge_cents, fees,
+                      style=exec_cfg.entry_style, max_spread_cents=exec_cfg.max_spread_cents)
+            if isinstance(q, NoQuote):
+                self._stage(run, a.market_ticker, "no_edge", q.detail or q.reason,
+                            yes_bid=a.yes_bid, yes_ask=a.yes_ask)
+                continue
+            rec = self._recommendation(a, q, m, run)
+            self.ledger.save_recommendation(rec)
+            recs.append(rec)
+            self._stage(run, a.market_ticker, "priced",
+                        f"{q.side.value} @ {q.price_cents}¢ (max {q.max_price_cents}¢), "
+                        f"edge {q.edge_cents:.1f}¢", rec_id=rec.rec_id)
+        run.recommendations = len(recs)
+        return recs
+
+    @staticmethod
+    def _recommendation(a: Assessment, q: Quote, m: Market, run: ResearchRun) -> Recommendation:
+        mid = None
+        if q.bid_cents is not None and q.ask_cents is not None:
+            mid = (q.bid_cents + q.ask_cents) / 200.0
+        return Recommendation(
+            assessment_id=a.assessment_id,
+            run_id=run.run_id,
+            market_ticker=m.ticker,
+            event_ticker=m.event_ticker or event_of(m.ticker),
+            title=m.title,
+            side=q.side,
+            limit_price_cents=q.price_cents,
+            max_price_cents=q.max_price_cents,
+            target_size_contracts=0,
+            estimated_fair_prob=q.fair_prob,
+            fair_yes_prob=a.fair_yes_prob,
+            market_implied_prob=mid if mid is not None else q.price_cents / 100.0,
+            edge_bps=int(round(q.edge_cents * 100)),
+            edge_cents_after_fees=round(q.edge_cents, 2),
+            fee_cents_per_contract=round(q.fee_cents, 3),
+            confidence=a.confidence,
+            thesis=a.thesis,
+            sources=a.sources,
+            market_close_time=naive_utc(m.close_time),
+        )
+
+    # ------------------------------------------------------------------
+    # 4-5. QA and act
+    # ------------------------------------------------------------------
+
+    async def _qa_and_act(self, client: KalshiClient, run: ResearchRun, rec: Recommendation,
+                          market: Market, ctx: PortfolioContext, risk_cfg: Any, exec_cfg: Any,
+                          mode: OperationalMode) -> None:
+        decision = evaluate(
+            rec, risk_cfg, ctx,
+            {"open_interest": market.open_interest, "volume": market.volume},
+            order_ttl_hours=exec_cfg.order_ttl_hours,
+            cancel_before_close_minutes=exec_cfg.cancel_before_close_minutes,
+        )
+        self.ledger.save_decision(decision)
+        self.on_event("decision", {
+            "run_id": run.run_id, "rec_id": rec.rec_id, "ticker": rec.market_ticker,
+            "side": rec.side.value, "price": rec.limit_price_cents,
+            "size": decision.approved_order.size_contracts if decision.approved_order else 0,
+            "edge_cents": rec.edge_cents_after_fees, "verdict": decision.decision.value,
+            "notes": decision.qa_notes, "thesis": rec.thesis[:240],
+        })
+        if decision.decision == DecisionVerdict.DENY:
+            self._stage(run, rec.market_ticker, "denied", decision.qa_notes)
+            return
+
+        run.approved += 1
+        ao = decision.approved_order
+        assert ao is not None
+        self._reserve(ctx, rec, ao.size_contracts)
+
+        if mode == OperationalMode.AUTONOMOUS:
+            try:
+                fees = await self._fee_model(client, market.series_ticker)
+                order = await place_order(ao, rec.rec_id, client, self.ledger, fees=fees,
+                                          market_close_time=rec.market_close_time)
+                run.submitted += 1
+                self._stage(run, rec.market_ticker, "submitted",
+                            f"{order.side.value} {order.size_contracts} @ {order.limit_price_cents}¢",
+                            order_id=order.order_id)
+                self.on_event("order_submitted", {"rec_id": rec.rec_id, "ticker": rec.market_ticker,
+                                                  "price": order.limit_price_cents,
+                                                  "size": order.size_contracts,
+                                                  "kalshi_order_id": order.kalshi_order_id})
+            except PreflightError as e:
+                self._stage(run, rec.market_ticker, "preflight_blocked", str(e))
+            except Exception as e:
+                self._stage(run, rec.market_ticker, "order_failed", str(e)[:300])
+            return
 
         order = Order(
             client_order_id=ao.client_order_id,
             rec_id=rec.rec_id,
-            market_ticker=ao.market_ticker,
-            side=ao.side,
-            order_type=ao.order_type,
+            market_ticker=rec.market_ticker,
+            side=rec.side,
             limit_price_cents=ao.limit_price_cents,
+            max_price_cents=ao.max_price_cents,
             size_contracts=ao.size_contracts,
-            status=status,
-            env=KalshiEnv(os.getenv("KALSHI_ENV", "demo")),
+            expires_at=ao.expiry_ts,
+            market_close_time=rec.market_close_time,
+            env=KalshiEnv(os.getenv("KALSHI_ENV", "demo").lower()),
+            status=(OrderStatus.PENDING_APPROVAL if mode == OperationalMode.HITL
+                    else OrderStatus.APPROVED),
+            status_reason="" if mode == OperationalMode.HITL else "paper mode — not sent",
         )
         self.ledger.save_order(order)
-
         if mode == OperationalMode.HITL:
+            self._stage(run, rec.market_ticker, "awaiting_approval",
+                        f"{order.side.value} {order.size_contracts} @ {order.limit_price_cents}¢")
             notify_pending_approval(order, decision)
+            self.on_event("pending_approval", {"rec_id": rec.rec_id, "ticker": rec.market_ticker})
+        else:
+            self._stage(run, rec.market_ticker, "paper_order",
+                        f"{order.side.value} {order.size_contracts} @ {order.limit_price_cents}¢")
+
+    @staticmethod
+    def _reserve(ctx: PortfolioContext, rec: Recommendation, size: int) -> None:
+        """Count an approved order against the caps for the rest of this cycle."""
+        cost = size * rec.limit_price_cents
+        ctx.current_deployed_cents += cost
+        ctx.open_exposure_cents += cost
+        ev, cat = rec.event_ticker, category_of(rec.market_ticker)
+        ctx.positions_by_event[ev] = ctx.positions_by_event.get(ev, 0) + cost
+        ctx.positions_by_category[cat] = ctx.positions_by_category.get(cat, 0) + cost
+        ctx.positions_count_by_event[ev] = ctx.positions_count_by_event.get(ev, 0) + 1
+        ctx.held_tickers.add(rec.market_ticker)
+        ctx.today_new_trades += 1
+        if ctx.available_cash_cents is not None:
+            ctx.available_cash_cents -= cost

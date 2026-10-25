@@ -1,20 +1,13 @@
-# /deny — Deny a pending HITL trade
+---
+description: Deny a trade waiting in Approval mode
+argument-hint: <rec_id> [reason]
+---
 
-Cancels a trade awaiting HITL approval without submitting it to Kalshi.
+With the dashboard running locally, deny the pending trade given in `$ARGUMENTS` (first word is the rec_id, the rest is an optional reason):
 
-## Usage
-
+```bash
+curl -s -X POST -H "X-Requested-With: kalshi-dashboard" \
+  "http://127.0.0.1:8000/api/deny/<rec_id>?reason=<url-encoded reason>"
 ```
-/deny <rec_id> [optional reason]
-```
 
-## What this does
-
-1. Calls `src.execute.hitl.deny(rec_id, ledger, reason)`.
-2. Updates the Order status to `CANCELLED`.
-3. Writes audit entry `HITL_DENIED` with your reason.
-4. The recommendation and QA decision remain in the ledger for performance tracking.
-
-## Note
-
-Denied trades count as "no trade taken" in performance analytics. If you deny trades frequently due to a specific pattern, check whether the QA Agent's rules need tightening (edit `config/risk.yaml`).
+Report whether it succeeded. Nothing is sent to Kalshi.

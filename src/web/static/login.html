@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sign in · Kalshi Research Center</title>
+  <link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/css/app.css">
+  <script type="module" src="/static/login.js"></script>
+</head>
+<body>
+  <div class="login-wrap">
+    <form id="login" class="card stack">
+      <h2>Kalshi Research Center</h2>
+      <p class="ink2 small">Enter the dashboard password (DASHBOARD_PASSWORD).</p>
+      <label class="field"><span>Password</span>
+        <input type="password" name="password" autocomplete="current-password" required autofocus></label>
+      <p id="err" class="neg small hidden"></p>
+      <button class="btn primary" type="submit">Sign in</button>
+    </form>
+  </div>
+</body>
+</html>

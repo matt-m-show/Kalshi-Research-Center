@@ -1,4 +1,4 @@
-# Updated via dashboard — 2026-05-09 21:37 UTC
+# config/universe.yaml — which Kalshi series the research agent may trade.
 categories:
   include:
   - KXNBA
@@ -7,18 +7,6 @@ categories:
   - KXNEWPOPE
   - KXFED
   exclude: []
-tickers:
-  explicit_include: []
-  explicit_exclude: []
 time_filters:
   min_hours_to_resolution: 1
-  trading_hours_utc_start: 0
-  trading_hours_utc_end: 2359
-  trading_days:
-  - 0
-  - 1
-  - 2
-  - 3
-  - 4
-  - 5
-min_edge_bps: 200
+  max_days_to_resolution: 30    # skip long-dated markets that would tie up capital

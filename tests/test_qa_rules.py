@@ -1,242 +1,143 @@
 """Tests for the deterministic QA rule engine."""
 
-import dataclasses
-from datetime import datetime, timezone
-
-import pytest
+from datetime import timedelta
 
 from src.common.schemas import (
     Confidence,
     DecisionVerdict,
     Recommendation,
     Side,
-    TimeHorizon,
+    Source,
     TrustTier,
+    utcnow,
 )
-from src.kalshi_client.models import Orderbook, OrderbookLevel
 from src.qa.rules import (
     PortfolioContext,
     RiskConfig,
+    effective_bankroll,
     evaluate,
     gate_brier_score,
     gate_daily_drawdown,
-    gate_event_concentration,
-    gate_liquidity,
-    gate_max_deployed,
-    gate_position_size,
-    gate_price_staleness,
     gate_source_quality,
+    size_position,
 )
 
-
-def _make_config(**overrides) -> RiskConfig:
-    defaults = dict(
-        bankroll_cents=100_000,
-        max_total_deployed_cents=80_000,
-        max_loss_cents=5_000,
-        max_position_pct=0.05,
-        max_size_contracts=200,
-        max_drawdown_cents=10_000,
-        max_new_trades_per_day=10,
-        max_open_exposure_cents=50_000,
-        max_pct_per_event=0.20,
-        max_pct_per_category=0.30,
-        max_correlated_positions=3,
-        min_open_interest=100,
-        min_daily_volume=50,
-        max_spread_bps=500,
-        max_price_staleness_bps=500,
-        max_brier_score=None,
-    )
-    defaults.update(overrides)
-    return RiskConfig(**defaults)
+MARKET = {"open_interest": 1000, "volume": 500}
 
 
-def _make_rec(**overrides) -> Recommendation:
+def cfg(**overrides) -> RiskConfig:
     base = dict(
-        market_ticker="KXPRES-25NOV-X",
-        event_ticker="KXPRES-25NOV",
-        side=Side.YES,
-        limit_price_cents=45,
-        target_size_contracts=20,
-        estimated_fair_prob=0.60,
-        market_implied_prob=0.45,
-        edge_bps=1500,
-        time_horizon=TimeHorizon.SWING,
-        exit_conditions={"take_profit_prob": 0.68, "stop_loss_prob": 0.38, "invalidation_event": "Poll reversal"},
-        confidence=Confidence.MEDIUM,
-        thesis="Strong indicator X supports YES.",
-        sources=[{"title": "AP Report", "url": "https://ap.org/1", "retrieved_at": datetime.utcnow(), "trust_tier": TrustTier.PRIMARY}],
-        hard_constraints_declared={"must_be_in_universe": True, "respects_max_position_pct": True},
+        bankroll_cents=100_000, max_total_deployed_cents=80_000, max_loss_cents=5_000,
+        max_position_pct=0.05, max_size_contracts=200, max_drawdown_cents=10_000,
+        max_new_trades_per_day=10, max_open_exposure_cents=50_000, max_pct_per_event=0.20,
+        max_pct_per_category=0.30, max_correlated_positions=3, min_open_interest=100,
+        min_daily_volume=50, min_edge_cents=3.0,
+    )
+    base.update(overrides)
+    return RiskConfig(**base)
+
+
+def rec(**overrides) -> Recommendation:
+    base = dict(
+        market_ticker="KXPRES-25NOV-X", event_ticker="KXPRES-25NOV", side=Side.YES,
+        limit_price_cents=45, max_price_cents=55, target_size_contracts=0,
+        estimated_fair_prob=0.60, fair_yes_prob=0.60, edge_cents_after_fees=15.0,
+        confidence=Confidence.MEDIUM, thesis="Strong indicator X supports YES.",
+        sources=[Source(title="AP", url="https://ap.org/1", trust_tier=TrustTier.PRIMARY)],
     )
     base.update(overrides)
     return Recommendation(**base)
 
 
-def _make_ob(bid: int = 43, ask: int = 47) -> Orderbook:
-    return Orderbook(
-        market_ticker="KXPRES-25NOV-X",
-        yes=[OrderbookLevel(price=bid, delta=100)],
-        no=[OrderbookLevel(price=100 - ask, delta=100)],
-    )
+class TestSizing:
+    def test_kelly_binds_by_default(self):
+        size, binding = size_position(rec(), cfg(), PortfolioContext())
+        assert binding == "KELLY" and size > 0
+
+    def test_max_loss_binds(self):
+        size, binding = size_position(rec(), cfg(max_loss_cents=450, max_position_pct=1.0),
+                                      PortfolioContext())
+        assert (size, binding) == (10, "MAX_LOSS")
+
+    def test_cash_binds(self):
+        # Mostly deployed already: bankroll is large, but only $2 of cash is free
+        ctx = PortfolioContext(available_cash_cents=200, current_deployed_cents=50_000)
+        size, binding = size_position(rec(), cfg(), ctx)
+        assert binding == "CASH" and size == 4
+
+    def test_deploy_ceiling_binds(self):
+        ctx = PortfolioContext(current_deployed_cents=79_900)
+        size, binding = size_position(rec(), cfg(), ctx)
+        assert binding == "DEPLOY_CEILING" and size == 2
+
+    def test_event_concentration_binds(self):
+        ctx = PortfolioContext(positions_by_event={"KXPRES-25NOV": 19_900})
+        size, binding = size_position(rec(), cfg(), ctx)
+        assert binding == "EVENT_CONCENTRATION" and size == 2
+
+    def test_bankroll_capped_by_live_account(self):
+        ctx = PortfolioContext(available_cash_cents=3_000, current_deployed_cents=2_000)
+        assert effective_bankroll(cfg(), ctx) == 5_000
+
+    def test_no_side_uses_side_probability(self):
+        # Buying NO at 40¢ with 70% NO probability is a positive-Kelly trade
+        size, _ = size_position(rec(side=Side.NO, limit_price_cents=40, estimated_fair_prob=0.70,
+                                    fair_yes_prob=0.30), cfg(), PortfolioContext())
+        assert size > 0
 
 
-def _make_ctx(**overrides) -> PortfolioContext:
-    defaults = dict(
-        current_deployed_cents=0,
-        daily_pnl_cents=0,
-        today_new_trades=0,
-        open_exposure_cents=0,
-        positions_by_event={},
-        positions_by_category={},
-        correlated_count=0,
-    )
-    defaults.update(overrides)
-    return PortfolioContext(**defaults)
+class TestGates:
+    def test_drawdown(self):
+        assert gate_daily_drawdown(PortfolioContext(daily_pnl_cents=-2000), cfg(), 3000).passed
+        assert not gate_daily_drawdown(PortfolioContext(daily_pnl_cents=-8000), cfg(), 3000).passed
+
+    def test_source_quality_requires_tier1(self):
+        assert gate_source_quality(rec()).passed
+        social = rec(sources=[Source(title="r", url="https://reddit.com", trust_tier=TrustTier.SOCIAL)])
+        assert not gate_source_quality(social).passed
+        assert not gate_source_quality(rec(sources=[])).passed
+
+    def test_brier_gate(self):
+        c = cfg(max_brier_score=0.25, min_trades_for_brier_gate=10)
+        bad = PortfolioContext(research_trade_count_by_category={"KXPRES": 15},
+                               research_brier_by_category={"KXPRES": 0.35})
+        thin = PortfolioContext(research_trade_count_by_category={"KXPRES": 5})
+        assert not gate_brier_score(rec(), bad, c).passed
+        assert gate_brier_score(rec(), thin, c).passed
+        assert gate_brier_score(rec(), bad, cfg()).code == "BRIER_GATE_DISABLED"
 
 
-class TestGatePositionSize:
-    def test_passes_normal(self):
-        rec = _make_rec(target_size_contracts=10, limit_price_cents=50)
-        cfg = _make_config(max_loss_cents=5000, max_size_contracts=100)
-        result = gate_position_size(rec, cfg, _make_ob())
-        assert result.passed
+class TestEvaluate:
+    def test_approves_and_sizes(self):
+        d = evaluate(rec(), cfg(), PortfolioContext(), MARKET)
+        assert d.decision in (DecisionVerdict.APPROVE, DecisionVerdict.MODIFY)
+        ao = d.approved_order
+        assert ao is not None and ao.size_contracts > 0
+        assert ao.limit_price_cents == 45 and ao.max_price_cents == 55 and ao.post_only
 
-    def test_fails_too_large(self):
-        rec = _make_rec(target_size_contracts=200, limit_price_cents=50)
-        cfg = _make_config(max_loss_cents=500)
-        result = gate_position_size(rec, cfg, _make_ob())
-        assert not result.passed
-        assert "SIZE_EXCEEDS" in result.code
+    def test_denies_low_edge(self):
+        d = evaluate(rec(edge_cents_after_fees=1.0), cfg(), PortfolioContext(), MARKET)
+        assert d.decision == DecisionVerdict.DENY and "EDGE_BELOW_MIN" in d.qa_notes
 
-    def test_fails_contract_cap(self):
-        rec = _make_rec(target_size_contracts=500)
-        cfg = _make_config(max_size_contracts=100)
-        result = gate_position_size(rec, cfg, _make_ob())
-        assert not result.passed
+    def test_denies_when_already_held(self):
+        ctx = PortfolioContext(held_tickers={"KXPRES-25NOV-X"})
+        assert evaluate(rec(), cfg(), ctx, MARKET).decision == DecisionVerdict.DENY
 
+    def test_denies_correlated(self):
+        ctx = PortfolioContext(positions_count_by_event={"KXPRES-25NOV": 3})
+        assert evaluate(rec(), cfg(), ctx, MARKET).decision == DecisionVerdict.DENY
 
-class TestGateDailyDrawdown:
-    def test_passes_under_budget(self):
-        ctx = _make_ctx(daily_pnl_cents=-2000)
-        cfg = _make_config(max_drawdown_cents=10_000)
-        result = gate_daily_drawdown(ctx, cfg, trade_loss=3000)
-        assert result.passed
+    def test_denies_size_zero(self):
+        d = evaluate(rec(), cfg(), PortfolioContext(available_cash_cents=10), MARKET)
+        assert d.decision == DecisionVerdict.DENY and "SIZE_ZERO" in d.reason_codes
 
-    def test_fails_over_budget(self):
-        ctx = _make_ctx(daily_pnl_cents=-8000)
-        cfg = _make_config(max_drawdown_cents=10_000)
-        result = gate_daily_drawdown(ctx, cfg, trade_loss=3000)
-        assert not result.passed
+    def test_low_confidence_halves(self):
+        full = evaluate(rec(), cfg(), PortfolioContext(), MARKET).approved_order.size_contracts
+        low = evaluate(rec(confidence=Confidence.LOW), cfg(), PortfolioContext(), MARKET)
+        assert low.approved_order.size_contracts == max(1, full // 2)
 
-
-class TestGateMaxDeployed:
-    def test_passes(self):
-        ctx = _make_ctx(current_deployed_cents=50_000)
-        cfg = _make_config(max_total_deployed_cents=80_000)
-        result = gate_max_deployed(ctx, cfg, new_exposure=20_000)
-        assert result.passed
-
-    def test_fails(self):
-        ctx = _make_ctx(current_deployed_cents=70_000)
-        cfg = _make_config(max_total_deployed_cents=80_000)
-        result = gate_max_deployed(ctx, cfg, new_exposure=15_000)
-        assert not result.passed
-
-
-class TestGatePriceStaleness:
-    def test_passes_close_price(self):
-        rec = _make_rec(limit_price_cents=45)
-        ob = _make_ob(bid=43, ask=47)  # mid = 45
-        result = gate_price_staleness(rec, ob)
-        assert result.passed
-
-    def test_fails_large_drift(self):
-        rec = _make_rec(limit_price_cents=45)
-        ob = _make_ob(bid=10, ask=15)  # mid = ~12.5, huge drift from 45
-        result = gate_price_staleness(rec, ob)
-        assert not result.passed
-
-
-class TestGateSourceQuality:
-    def test_passes_with_tier1(self):
-        rec = _make_rec()
-        result = gate_source_quality(rec)
-        assert result.passed
-
-    def test_fails_social_only(self):
-        # Bypass the Recommendation constructor (which enforces tier-1) and test the gate directly
-        from unittest.mock import MagicMock
-        from src.common.schemas import Source
-        mock_rec = MagicMock()
-        mock_rec.sources = [
-            Source(title="Reddit post", url="https://reddit.com/r/1",
-                   retrieved_at=datetime.utcnow(), trust_tier=TrustTier.SOCIAL)
-        ]
-        result = gate_source_quality(mock_rec)
-        assert not result.passed
-
-
-class TestGateLiquidity:
-    def test_passes(self):
-        rec = _make_rec()
-        cfg = _make_config(min_open_interest=100, min_daily_volume=50)
-        market_data = {"open_interest": 500, "volume": 200}
-        result = gate_liquidity(rec, market_data, cfg)
-        assert result.passed
-
-    def test_fails_low_oi(self):
-        rec = _make_rec()
-        cfg = _make_config(min_open_interest=1000)
-        market_data = {"open_interest": 50, "volume": 200}
-        result = gate_liquidity(rec, market_data, cfg)
-        assert not result.passed
-
-
-class TestGateBrierScore:
-    def test_skips_when_disabled(self):
-        rec = _make_rec()
-        cfg = _make_config(max_brier_score=None)
-        ctx = _make_ctx()
-        result = gate_brier_score(rec, ctx, cfg)
-        assert result.passed
-        assert result.code == "BRIER_GATE_DISABLED"
-
-    def test_skips_insufficient_history(self):
-        rec = _make_rec()
-        cfg = _make_config(max_brier_score=0.25, min_trades_for_brier_gate=20)
-        ctx = _make_ctx(research_trade_count_by_category={"KXPRES": 5})
-        result = gate_brier_score(rec, ctx, cfg)
-        assert result.passed
-
-    def test_fails_high_brier(self):
-        rec = _make_rec()
-        cfg = _make_config(max_brier_score=0.25, min_trades_for_brier_gate=10)
-        ctx = _make_ctx(
-            research_trade_count_by_category={"KXPRES": 15},
-            research_brier_by_category={"KXPRES": 0.35},
-        )
-        result = gate_brier_score(rec, ctx, cfg)
-        assert not result.passed
-
-
-class TestEvaluateFull:
-    def test_approve_clean_trade(self):
-        rec = _make_rec(target_size_contracts=5, limit_price_cents=45)
-        cfg = _make_config()
-        ctx = _make_ctx()
-        ob = _make_ob()
-        market_data = {"open_interest": 1000, "volume": 500}
-        decision = evaluate(rec, cfg, ctx, ob, market_data)
-        assert decision.decision in (DecisionVerdict.APPROVE, DecisionVerdict.MODIFY)
-        assert decision.approved_order is not None
-
-    def test_deny_oversized(self):
-        rec = _make_rec(target_size_contracts=1000, limit_price_cents=90)
-        cfg = _make_config(max_loss_cents=1000, max_size_contracts=10)
-        ctx = _make_ctx()
-        ob = _make_ob(bid=88, ask=92)
-        market_data = {"open_interest": 1000, "volume": 500}
-        decision = evaluate(rec, cfg, ctx, ob, market_data)
-        assert decision.decision == DecisionVerdict.DENY
-        assert decision.approved_order is None
+    def test_expiry_before_market_close(self):
+        close = utcnow() + timedelta(hours=1)
+        d = evaluate(rec(market_close_time=close), cfg(), PortfolioContext(), MARKET,
+                     order_ttl_hours=6, cancel_before_close_minutes=15)
+        assert d.approved_order.expiry_ts <= close - timedelta(minutes=14)

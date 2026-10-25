@@ -1,266 +1,173 @@
-# Kalshi Multi-Agent Trading System
+# Kalshi Research Center
 
-An autonomous prediction market trading system for [Kalshi](https://kalshi.com) powered by Claude. A research agent identifies markets with mispriced probabilities, a deterministic QA/risk engine validates every recommendation, and the execution layer submits orders automatically — all surfaced through a real-time web dashboard.
+A research-and-trading system for [Kalshi](https://kalshi.com) prediction markets. A local model and Claude research markets and estimate fair probabilities; a deterministic engine prices, sizes and risk-checks every trade; orders are posted as maker bids, managed until they fill or expire, and exited on take-profit, stop-loss or thesis-breaking news. A web dashboard (works on a phone) shows everything and lets you approve trades, tune settings and see what each run cost.
 
-> **Status:** Active development / experimental. Use the demo environment first.
+> Experimental software that can place real-money orders. Start with the demo environment or Paper mode, and use small amounts.
 
 ---
 
 ## How it works
 
 ```
-Research Agent (Claude Sonnet)
-  → finds markets where estimated probability ≠ market price
-  → cites tier-1 sources, sets anti-anchored probability estimates
-
-QA / Risk Engine (deterministic)
-  → 11 hard gates (position size, drawdown, liquidity, price staleness, …)
-  → Kelly position sizing (¼-Kelly by default)
-  → soft checks (volatility, spread, category concentration)
-
-Execute Layer
-  → pre-flight price check immediately before submission
-  → idempotent order placement via client_order_id
-  → full audit trail in SQLite ledger
-
-Dashboard (FastAPI + vanilla JS)
-  → live WebSocket feed, pending approvals, portfolio view, settings editor
+ every 30 min: any unassessed markets entering their research window?  (no LLM)
+        │ yes                                       (also a full sweep on an interval)
+        ▼
+ Candidate selection   in-universe series · time/liquidity filters · not held ·
+                       not assessed recently · ranked, capped per series/event
+        ▼
+ Local evidence pass   Ollama plans searches, runs them, digests facts with sources,
+ (optional, free)      scores research priority — dead ends never reach Claude
+        ▼
+ Research (Claude)     records a fair YES probability per market with sources,
+                       via strict tools; Kalshi prices are hidden by default so the
+                       estimate is independent; fetched pages are pre-summarized locally
+        ▼
+ Pricing engine        picks the side with edge, computes the most it will pay
+                       (fair − min edge − Kalshi fee), quotes a post-only bid inside
+                       the spread                                   (no LLM)
+        ▼
+ QA / risk engine      fractional-Kelly size shrunk to fit every cap (per trade, per
+                       day, deployed, per event/series, cash); hard gates on edge,
+                       sources, drawdown, correlation, calibration    (no LLM)
+        ▼
+ Mode                  Paper: record only · Approval: wait for you · Autonomous: send
+        ▼
+ Order manager         every 5 min: sync orders/fills, reprice outbid bids up to their
+                       max, cancel at TTL / before close, take-profit & stop-loss exits,
+                       news watch, record settlements, score every estimate, kill switches
 ```
 
-Operational modes: **Paper** (demo API, no real money) → **HITL** (live, manual approval per trade) → **Autonomous** (live, fully automated).
+Every market's path through these stages is recorded on the run and visible in the dashboard's **Runs** tab, along with token usage and cost per model.
+
+**Safety properties**
+
+- The LLM never sets a price or size. It only supplies a probability; everything that touches money is deterministic code with tests.
+- Orders are post-only bids that never cross the spread and never exceed their computed max price. Exits are immediate-or-cancel and reduce-only, so they can only shrink a position.
+- The system can't deposit or withdraw. It can only trade with the cash already in your Kalshi account, and sizing never assumes more than that cash.
+- Web pages, search results and model output are treated as untrusted: the research model is told to ignore instructions in them, the dashboard escapes all of it, and the page fetcher refuses private/local addresses.
+- Halt from the dashboard, with `/halt`, or by creating `data/HALT`. Kill switches halt on consecutive losses, drawdown and API error bursts.
+- Every recommendation, decision, order, fill, settlement, login and settings change is written to a hash-chained audit log.
 
 ---
 
-## Prerequisites
+## Quick start (Windows, native)
 
-- Python 3.12+ **or** Docker
-- A [Kalshi](https://kalshi.com) account with API access enabled
-- An [Anthropic API key](https://console.anthropic.com)
-- *(Optional but recommended)* A [Tavily](https://tavily.com) API key for reliable web search
+Requires Python 3.12+.
+
+```powershell
+git clone https://github.com/matt-m-show/kalshi-research-center.git
+cd kalshi-research-center
+py -m pip install -e ".[dev]"
+copy .env.example .env      # then edit .env
+.\start-web.ps1 -Env demo   # or -Env prod for real money
+```
+
+Open **http://127.0.0.1:8000**. The first time, go to **Settings → Markets** and pick the series you want to trade, choose a **Trading mode**, then use **☰ → Run research now** or **Start schedule**.
+
+`start-web.ps1` reads `.env`, prompts for `ANTHROPIC_API_KEY` if it isn't set, and listens on 127.0.0.1 only.
+
+### Kalshi credentials
+
+1. On kalshi.com → **Settings → API Keys**, create a key. You get a key ID (UUID) and a private key (PEM).
+2. Either put them in `.env` (`KALSHI_KEY_ID`, and `KALSHI_PEM_B64` = the PEM base64-encoded — see `.env.example`), or store them in Windows Credential Manager:
+
+```powershell
+py -m src.kalshi_client.auth setup --env prod --key-id <your-key-id>
+```
+
+`KALSHI_ENV=demo` uses Kalshi's demo exchange (separate demo keys); `KALSHI_ENV=prod` trades real money.
+
+### Local model (optional, recommended)
+
+Install [Ollama](https://ollama.com) and pull a model with tool support:
+
+```powershell
+ollama pull qwen3:8b
+```
+
+Set it under **Settings → Research, models & budget → Local Ollama model** (default `qwen3.5:4b`). The status line there shows whether it's reachable. Without a local model everything still works; Claude just does more of the searching, which costs more.
 
 ---
 
-## Quick start — Docker (recommended)
-
-### 1. Clone and configure
+## Quick start (Docker)
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/kalshi-agents.git
-cd kalshi-agents
-cp .env.example .env
-```
-
-Edit `.env` with your credentials (see [Credentials setup](#credentials-setup) below).
-
-### 2. Start the dashboard
-
-```bash
+cp .env.example .env    # set KALSHI_*, ANTHROPIC_API_KEY, and DASHBOARD_PASSWORD
 docker compose up -d
 ```
 
-Open **http://localhost:8000** in your browser.
-
-### 3. Run a research cycle
-
-Click **▶ Run Now** in the dashboard header, or click **Start Agents** to begin running automatically every 30 minutes.
+The container publishes on 127.0.0.1:8000 only and reaches Ollama on the host at `host.docker.internal:11434`. Because requests into a container don't arrive from loopback, **Docker requires `DASHBOARD_PASSWORD`**.
 
 ---
 
-## Quick start — Native Python
+## Phone access
 
-### 1. Clone and install
+The dashboard is a responsive web app you can add to your home screen. Don't expose it to the internet; use [Tailscale](https://tailscale.com) (free for personal use) so only your own devices can reach it:
 
-```bash
-git clone https://github.com/YOUR_USERNAME/kalshi-agents.git
-cd kalshi-agents
-pip install -e ".[dev]"
-```
+1. Set a long random `DASHBOARD_PASSWORD` in `.env` and restart the dashboard.
+2. Install Tailscale on the PC and your phone, signed in to the same account.
+3. On the PC: `tailscale serve --bg 8000`. Tailscale prints an `https://<pc-name>.<tailnet>.ts.net` URL.
+4. Open that URL on your phone, sign in with the password, and use **Share → Add to Home Screen**.
 
-### 2. Configure credentials
-
-```bash
-cp .env.example .env
-# Edit .env with your ANTHROPIC_API_KEY and Tavily key
-```
-
-For Kalshi credentials on Windows/Mac/Linux, the native path uses your OS keychain:
-
-```bash
-python -m src.kalshi_client.auth setup --env demo --key-id YOUR-API-KEY-UUID
-# Paste your RSA private key PEM at the prompt, then press Enter twice
-```
-
-Alternatively, set `KALSHI_KEY_ID` and `KALSHI_PEM_B64` in `.env` (see below).
-
-### 3. Load environment and run
-
-**Windows (PowerShell):**
-```powershell
-Get-Content .env | ForEach-Object {
-    if ($_ -match '^([^#][^=]*)=(.*)$') { [System.Environment]::SetEnvironmentVariable($Matches[1], $Matches[2]) }
-}
-uvicorn src.web.app:app --reload --port 8000
-```
-
-**Mac/Linux:**
-```bash
-export $(grep -v '^#' .env | xargs)
-uvicorn src.web.app:app --reload --port 8000
-```
-
-Open **http://localhost:8000**.
+Access rules: direct requests from the PC itself are allowed without a password (set `DASHBOARD_TRUST_LOCALHOST=false` to require it everywhere). Anything else — including requests relayed by `tailscale serve` — needs a signed-in session. Sessions last 30 days; logins are rate-limited; state-changing API calls require a same-origin header, and responses carry a strict Content-Security-Policy.
 
 ---
 
-## Credentials setup
+## The dashboard
 
-### Getting your Kalshi API credentials
+| Tab | What's there |
+|---|---|
+| **Overview** | Trading posture, cash, open value, realized P&L (after API costs), API spend vs budget, forecast accuracy, schedule and next runs, latest run, live activity |
+| **Approvals** | In Approval mode: one card per trade — fair value vs the live bid/ask, edge after fees, size and max-price controls (can only be tightened), thesis, sources by trust tier |
+| **Positions** | Open positions marked at the bid with their exit plan and a Sell-now button, resting orders with Cancel, P&L vs API spend, calibration chart, accuracy by series, closed positions, order history |
+| **Runs** | Every research run: the funnel from considered to sent, per-model tokens and cost, each market's stage and the reason, and the full assessments with sources |
+| **Settings** | Trading mode; plain-English changes (a local model proposes, you review the diff); market picker that browses Kalshi's series; risk presets and limits; execution and exit rules; research schedule, models and budget; change history with revert |
 
-1. Log into [Kalshi](https://kalshi.com) → **Settings → API Keys**
-2. Generate a new RSA keypair — Kalshi gives you a UUID (Key ID) and a PEM private key
-3. Start with `KALSHI_ENV=demo` (paper trading against the demo API)
+The **☰** menu has Run research now, Sync orders, Start/Stop schedule, Halt/Resume, Flatten everything, and the light/dark toggle.
 
-### Storing credentials for Docker
+### Claude Code commands
 
-The easiest Docker approach is base64-encoding the PEM into an env var:
-
-**Linux/Mac:**
-```bash
-KALSHI_PEM_B64=$(base64 -w 0 ~/.kalshi/kalshi-demo.pem)
-echo "KALSHI_PEM_B64=$KALSHI_PEM_B64" >> .env
-```
-
-**Windows (PowerShell):**
-```powershell
-$pem = [Convert]::ToBase64String([IO.File]::ReadAllBytes("$HOME\.kalshi\kalshi-demo.pem"))
-Add-Content .env "KALSHI_PEM_B64=$pem"
-```
-
-Then set `KALSHI_KEY_ID=your-uuid` in `.env`.
-
-### Storing credentials natively (Windows Credential Manager / macOS Keychain)
-
-```bash
-python -m src.kalshi_client.auth setup --env demo --key-id YOUR-UUID
-# Run again with --env prod when ready for live trading
-```
+With the dashboard running, `/status`, `/run`, `/approve`, `/deny`, `/mode`, `/halt`, `/resume` and `/flatten` drive it from Claude Code through the same local API.
 
 ---
 
 ## Configuration
 
-All configuration lives in `config/`. Changes take effect on the next research cycle — no restart required (the dashboard Settings tab can edit these directly).
+Everything is editable in **Settings**; the files live in `config/` and are validated on every save (a bad value is rejected, never reinterpreted). Percentages are fractions (`0.25` = 25%).
 
-### `config/risk.yaml` — Position sizing and risk limits
+| File | Key settings |
+|---|---|
+| `risk.yaml` | bankroll and caps (per trade, per day, total deployed, per event/series), `per_trade.min_edge_cents`, Kelly fraction, `execution` (passive vs take, repricing, order TTL), `exits` (take-profit capture, stop-loss %, news watch), kill switches |
+| `universe.yaml` | `categories.include` (Kalshi series tickers), hours/days-to-resolution filters |
+| `runtime.yaml` | research schedule and `event_trigger` windows (with per-series overrides), candidates per run, `models` (Claude + local), `local_llm` switches, `budget` (monthly and per-run API caps) |
 
-| Setting | Description | Default |
-|---------|-------------|---------|
-| `bankroll.total_capital_usd` | Total account capital | 100 |
-| `per_trade.max_loss_usd` | Max loss per trade | 50 |
-| `per_trade.max_size_contracts` | Max contracts per order | 50 |
-| `per_day.max_new_trades` | Max new positions per day | 5 |
-| `liquidity_floors.min_open_interest` | Skip markets with OI below this | 0 |
-| `preflight.max_slippage_bps` | Abort order if price drifted this far since QA approval | 1500 |
-
-### `config/universe.yaml` — Which markets to trade
-
-```yaml
-categories:
-  include:
-    - KXNBA      # NBA
-    - KXNHL      # NHL
-    - KXBTC      # Bitcoin price
-    - KXFED      # Fed rate decisions
-  exclude: []
-
-time_filters:
-  min_hours_to_resolution: 1
-
-min_edge_bps: 200   # skip markets with < 200bps estimated edge
-```
-
-### `config/runtime.yaml` — Scheduling
-
-```yaml
-research:
-  interval_minutes: 30
-  max_recommendations_per_run: 5
-```
-
----
-
-## Dashboard
-
-| Section | Description |
-|---------|-------------|
-| **Overview** | System stats, live Kalshi account balance and positions |
-| **Pending Approval** | Trades queued for manual review (HITL mode) |
-| **Recommendations** | Full history of all research agent output with QA verdicts |
-| **Live Feed** | Real-time WebSocket event stream |
-| **Settings** | Edit all config files without touching the filesystem |
-
-### Operational modes
-
-Switch modes from the **HITL / AUTO** button in the header:
-
-| Mode | Behavior |
-|------|----------|
-| **Paper** | Trades recorded but never sent to Kalshi. Safe to experiment. |
-| **HITL** | Each QA-approved trade appears in Pending Approval; you click ✓ or ✕. |
-| **Autonomous** | Trades submit automatically after passing QA and pre-flight. |
-
----
-
-## Security notes
-
-- **The private key never enters an LLM prompt or log file.** `src/kalshi_client/auth.py` reads it once at call time and uses it only for RSA-PSS request signing.
-- `KALSHI_ENV=demo` uses Kalshi's paper trading API — no real money is ever touched until you explicitly set `KALSHI_ENV=prod`.
-- **The system cannot initiate deposits.** It can only place and cancel orders using the funds already in your Kalshi account. Deposits require explicit action on the Kalshi website.
-- Research Agent tools are read-only (`WebFetch`, `WebSearch` only). It has no ability to place orders.
-- The audit log in `data/audit.log` is append-only JSONL — every order action is recorded.
-- Demo and production credentials are stored under separate keychain entries.
-
----
-
-## Running tests
-
-```bash
-pytest tests/ -v
-```
-
----
-
-## Architecture
-
-```
-src/
-  orchestrator.py         Main pipeline: Research → QA → Execute
-  kalshi_client/          Kalshi REST API client (auth, markets, orders, orderbooks)
-  qa/
-    rules.py              Deterministic risk gate engine (11 hard gates + 3 soft checks)
-    kelly.py              Quarter-Kelly position sizing
-  execute/
-    orders.py             Pre-flight check + idempotent order placement
-    hitl.py               Human-in-the-loop approval flow
-  common/
-    ledger.py             SQLite persistence for all artifacts
-    schemas.py            Pydantic models for all data types
-  web/
-    app.py                FastAPI backend (REST + WebSocket)
-    static/index.html     Single-page dashboard
-
-config/                   YAML config files (edit via Settings tab or directly)
-.claude/agents/           Research agent system prompt
-data/                     Runtime data (gitignored)
-```
-
----
+Series with `GAME` in the ticker (e.g. `KXNBAGAME`) are individual games; plain league series (e.g. `KXNBA`) are season-long futures.
 
 ## Cost
 
-Each research cycle costs roughly **$0.10–0.25** in Anthropic API credits (Claude Sonnet, ~10 candidate markets, ~5–10 tool calls). At a 30-minute interval that's ~$5–12/day if running continuously. Run on-demand with **▶ Run Now** to control costs.
+Claude only sees markets that passed the filters and the local pre-pass, with locally summarized pages and prompt caching on the growing conversation. The monthly budget (default $10) stops research for the rest of the month once reached; the per-run budget tells Claude to wrap up. Actual spend per run and per model is shown in **Runs**, and the Overview shows realized P&L net of API spend.
 
----
+## Development
+
+```powershell
+py -m pytest            # 150+ tests; no network or API keys needed
+py scheduler.py --diagnose --env prod     # which markets would be researched (no LLM, no orders)
+py scheduler.py --sync-orders --env prod  # one order-manager pass
+```
+
+```
+src/
+  orchestrator.py        selection → local pre-pass → research → pricing → QA → act
+  jobs.py                schedule: research sweep, window watch, order manager, report
+  research/              Claude loop (agent.py), web tools, local assist, cost meter
+  llm/ollama.py          local model client (schema-constrained JSON)
+  qa/                    pricing.py (fees, side, max price, passive quote), rules.py, kelly.py
+  execute/               orders.py (V2 order API), manager.py, exits.py, portfolio.py
+  kalshi_client/         signed REST client and models for Kalshi's API v2
+  common/                ledger.py (SQLite + audit chain), schemas.py, config.py
+  performance/           metrics, settlement/calibration tracking, reports
+  web/                   FastAPI app, auth, and the no-build dashboard in static/
+```
 
 ## License
 

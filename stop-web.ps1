@@ -1,4 +1,4 @@
-# stop-web.ps1 — Stop the Kalshi Trading System web dashboard
+# stop-web.ps1 - Stop the Kalshi dashboard
 # Usage: .\stop-web.ps1 [-Port 8000]
 param(
     [int]$Port = 8000
@@ -12,13 +12,13 @@ if (-not $connections) {
 }
 
 foreach ($conn in $connections) {
-    $pid = $conn.OwningProcess
-    $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
+    $procId = $conn.OwningProcess
+    $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
     if ($proc) {
-        Write-Host "Stopping '$($proc.Name)' (PID $pid) on port $Port..." -ForegroundColor Cyan
-        Stop-Process -Id $pid -Force
+        Write-Host "Stopping '$($proc.Name)' (PID $procId) on port $Port..." -ForegroundColor Cyan
+        Stop-Process -Id $procId -Force
         Write-Host "Stopped." -ForegroundColor Green
     } else {
-        Write-Warning "Could not find process with PID $pid."
+        Write-Warning "Could not find process with PID $procId."
     }
 }

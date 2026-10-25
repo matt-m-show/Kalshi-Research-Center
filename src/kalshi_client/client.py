@@ -21,13 +21,25 @@ from src.common.logging import get_logger
 from src.kalshi_client import auth
 from src.kalshi_client.models import (
     Balance,
-    CreateOrderRequest,
+    CreateOrderV2Request,
+    CreateOrderV2Response,
     KalshiFill,
     KalshiOrder,
     Market,
     Orderbook,
     Position,
+    Series,
+    Settlement,
 )
+
+
+class KalshiAPIError(RuntimeError):
+    """A 4xx from Kalshi, carrying the API's error code and message."""
+
+    def __init__(self, status: int, body: str, path: str) -> None:
+        self.status = status
+        self.body = body
+        super().__init__(f"Kalshi {status} on {path}: {body[:300]}")
 
 log = get_logger("kalshi_client")
 
@@ -135,7 +147,8 @@ class KalshiClient:
                 return resp.json()
             except httpx.HTTPStatusError as e:
                 if e.response.status_code < 500:
-                    raise  # 4xx — don't retry
+                    # 4xx — don't retry; surface Kalshi's error body
+                    raise KalshiAPIError(e.response.status_code, e.response.text, path) from e
                 last_exc = e
             except (httpx.TimeoutException, httpx.NetworkError) as e:
                 last_exc = e
@@ -146,31 +159,59 @@ class KalshiClient:
 
         raise RuntimeError(f"Request failed after {_MAX_RETRIES} attempts: {last_exc}")
 
+    async def _paged(
+        self, path: str, key: str, params: dict[str, Any], max_items: int
+    ) -> list[dict]:
+        """Follow ``cursor`` pagination until ``max_items`` rows or the last page."""
+        rows: list[dict] = []
+        params = {k: v for k, v in params.items() if v is not None}
+        while True:
+            data = await self._request("GET", path, params=params)
+            rows.extend(data.get(key, []) or [])
+            cursor = data.get("cursor")
+            if not cursor or len(rows) >= max_items:
+                return rows[:max_items]
+            params["cursor"] = cursor
+
     # ------------------------------------------------------------------
-    # Market data (public)
+    # Market data
     # ------------------------------------------------------------------
 
     async def get_markets(
         self,
-        status: str = "open",
+        status: str | None = "open",
         limit: int = 200,
-        cursor: str | None = None,
         event_ticker: str | None = None,
         series_ticker: str | None = None,
+        tickers: list[str] | None = None,
+        max_items: int | None = None,
     ) -> list[Market]:
-        params: dict[str, Any] = {"status": status, "limit": limit}
-        if cursor:
-            params["cursor"] = cursor
-        if event_ticker:
-            params["event_ticker"] = event_ticker
-        if series_ticker:
-            params["series_ticker"] = series_ticker
-        data = await self._request("GET", "/markets", params=params, authenticated=True)
-        return [Market.model_validate(m) for m in data.get("markets", [])]
+        params: dict[str, Any] = {
+            "status": status,
+            "limit": min(limit, 1000),
+            "event_ticker": event_ticker,
+            "series_ticker": series_ticker,
+            "tickers": ",".join(tickers) if tickers else None,
+        }
+        rows = await self._paged("/markets", "markets", params, max_items or limit)
+        return [Market.model_validate(m) for m in rows]
 
     async def get_market(self, ticker: str) -> Market:
-        data = await self._request("GET", f"/markets/{ticker}", authenticated=True)
+        data = await self._request("GET", f"/markets/{ticker}")
         return Market.model_validate(data.get("market", data))
+
+    async def get_series(self, series_ticker: str) -> Series:
+        data = await self._request("GET", f"/series/{series_ticker}")
+        return Series.model_validate(data.get("series", data))
+
+    async def get_series_list(
+        self, category: str | None = None, include_volume: bool = True
+    ) -> list[Series]:
+        params: dict[str, Any] = {"include_volume": str(include_volume).lower()}
+        if category:
+            params["category"] = category
+        data = await self._request("GET", "/series", params=params)
+        return [Series.model_validate(s) for s in data.get("series", []) or []]
 
     async def get_orderbook(self, ticker: str, depth: int = 10) -> Orderbook:
         data = await self._request(
@@ -210,53 +251,87 @@ class KalshiClient:
 
     async def get_balance(self) -> Balance:
         data = await self._request("GET", "/portfolio/balance")
-        raw = data.get("balance", data)
-        # Kalshi prod returns balance as a bare integer (cents); handle both shapes.
-        if isinstance(raw, (int, float)):
-            return Balance(balance=int(raw))
-        return Balance.model_validate(raw)
+        return Balance(
+            balance=int(data.get("balance") or 0),
+            portfolio_value=int(data.get("portfolio_value") or 0),
+        )
 
-    async def get_positions(self, limit: int = 200) -> list[Position]:
-        data = await self._request("GET", "/portfolio/positions", params={"limit": limit})
-        return [Position.model_validate(p) for p in data.get("market_positions", [])]
+    async def get_positions(
+        self, settlement_status: str = "unsettled", max_items: int = 1000
+    ) -> list[Position]:
+        rows = await self._paged(
+            "/portfolio/positions", "market_positions",
+            {"limit": 1000, "settlement_status": settlement_status, "count_filter": "position"},
+            max_items,
+        )
+        return [Position.model_validate(p) for p in rows]
 
-    async def get_orders(self, status: str | None = None, limit: int = 200) -> list[KalshiOrder]:
-        params: dict[str, Any] = {"limit": limit}
-        if status:
-            params["status"] = status
-        data = await self._request("GET", "/portfolio/orders", params=params)
-        return [KalshiOrder.model_validate(o) for o in data.get("orders", [])]
+    async def get_orders(
+        self,
+        status: str | None = None,
+        ticker: str | None = None,
+        min_ts: int | None = None,
+        max_items: int = 1000,
+    ) -> list[KalshiOrder]:
+        rows = await self._paged(
+            "/portfolio/orders", "orders",
+            {"limit": 1000, "status": status, "ticker": ticker, "min_ts": min_ts},
+            max_items,
+        )
+        return [KalshiOrder.model_validate(o) for o in rows]
 
-    async def get_fills(self, limit: int = 200, ticker: str | None = None) -> list[KalshiFill]:
-        params: dict[str, Any] = {"limit": limit}
-        if ticker:
-            params["ticker"] = ticker
-        data = await self._request("GET", "/portfolio/fills", params=params)
-        return [KalshiFill.model_validate(f) for f in data.get("fills", [])]
-
-    # ------------------------------------------------------------------
-    # Order placement (authenticated + write rate-limited)
-    # ------------------------------------------------------------------
-
-    async def create_order(self, req: CreateOrderRequest) -> KalshiOrder:
-        payload = req.model_dump(exclude_none=True)
-        data = await self._request("POST", "/portfolio/orders", json=payload)
-        order = data.get("order", data)
-        log.info("order_created", ticker=req.ticker, client_order_id=req.client_order_id)
-        return KalshiOrder.model_validate(order)
-
-    async def cancel_order(self, order_id: str) -> KalshiOrder:
-        data = await self._request("DELETE", f"/portfolio/orders/{order_id}")
-        log.info("order_cancelled", order_id=order_id)
+    async def get_order(self, order_id: str) -> KalshiOrder:
+        data = await self._request("GET", f"/portfolio/orders/{order_id}")
         return KalshiOrder.model_validate(data.get("order", data))
 
+    async def get_fills(
+        self, min_ts: int | None = None, ticker: str | None = None, max_items: int = 1000
+    ) -> list[KalshiFill]:
+        rows = await self._paged(
+            "/portfolio/fills", "fills",
+            {"limit": 1000, "min_ts": min_ts, "ticker": ticker},
+            max_items,
+        )
+        return [KalshiFill.model_validate(f) for f in rows]
+
+    async def get_settlements(
+        self, min_ts: int | None = None, max_items: int = 1000
+    ) -> list[Settlement]:
+        rows = await self._paged(
+            "/portfolio/settlements", "settlements",
+            {"limit": 1000, "min_ts": min_ts},
+            max_items,
+        )
+        return [Settlement.model_validate(s) for s in rows]
+
+    # ------------------------------------------------------------------
+    # Order placement (V2: YES-leg book sides, dollar-string prices)
+    # ------------------------------------------------------------------
+
+    async def create_order(self, req: CreateOrderV2Request) -> CreateOrderV2Response:
+        payload = req.model_dump(exclude_none=True)
+        data = await self._request("POST", "/portfolio/events/orders", json=payload)
+        resp = CreateOrderV2Response.model_validate(data.get("order", data))
+        log.info("order_created", ticker=req.ticker, side=req.side, price=req.price,
+                 count=req.count, order_id=resp.order_id, filled=resp.fill_count)
+        return resp
+
+    async def cancel_order(self, order_id: str, ticker: str | None = None) -> int:
+        """Cancel a resting order; returns the number of contracts cancelled."""
+        params = {"market_ticker": ticker} if ticker else None
+        data = await self._request(
+            "DELETE", f"/portfolio/events/orders/{order_id}", params=params
+        )
+        log.info("order_cancelled", order_id=order_id, ticker=ticker)
+        reduced = data.get("reduced_by", "0")
+        return int(float(reduced)) if reduced not in (None, "") else 0
+
     async def cancel_all_orders(self) -> list[str]:
-        """Cancel all open orders; returns list of cancelled order IDs."""
-        orders = await self.get_orders(status="resting")
+        """Cancel every resting order; returns the cancelled order IDs."""
         ids: list[str] = []
-        for o in orders:
+        for o in await self.get_orders(status="resting"):
             try:
-                await self.cancel_order(o.order_id)
+                await self.cancel_order(o.order_id, o.ticker)
                 ids.append(o.order_id)
             except Exception as e:
                 log.error("cancel_failed", order_id=o.order_id, error=str(e))

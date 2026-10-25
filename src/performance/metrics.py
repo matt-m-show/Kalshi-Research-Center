@@ -18,21 +18,21 @@ class ClosedTrade:
     market_ticker: str
     category: str                  # first segment of ticker, e.g. "KXPRES"
     side: str                      # "YES" | "NO"
-    avg_fill_price_cents: float
+    avg_fill_price_cents: float    # price paid for the side held
     size_contracts: int
-    resolved_price_cents: float    # 0 or 100 for binary markets
-    estimated_fair_prob: float     # Research Agent's estimate at recommendation time
+    resolved_price_cents: float    # YES settlement value: 0 or 100 for binary markets
+    estimated_fair_prob: float     # fair YES probability at recommendation time
     confidence: str
     closed_at: datetime
+    pnl_override_cents: float | None = None   # Kalshi's settlement P&L (fees, early exits)
 
 
 def realized_pnl_cents(trade: ClosedTrade) -> float:
     """Net P&L for one closed trade, in cents."""
-    if trade.side == "YES":
-        return trade.size_contracts * (trade.resolved_price_cents - trade.avg_fill_price_cents)
-    else:
-        # NO position: profit if market resolves NO (price = 0)
-        return trade.size_contracts * ((100 - trade.resolved_price_cents) - (100 - trade.avg_fill_price_cents))
+    if trade.pnl_override_cents is not None:
+        return trade.pnl_override_cents
+    payout = trade.resolved_price_cents if trade.side == "YES" else 100 - trade.resolved_price_cents
+    return trade.size_contracts * (payout - trade.avg_fill_price_cents)
 
 
 def brier_score(trades: Sequence[ClosedTrade]) -> float | None:
@@ -144,6 +144,8 @@ class RollingMetrics:
     pnl_by_category: dict[str, float]
     open_positions_count: int
     consecutive_losses: int
+    assessment_brier: float | None = None     # over every resolved estimate, traded or not
+    assessments_resolved: int = 0
 
 
 def compute_rolling_metrics(

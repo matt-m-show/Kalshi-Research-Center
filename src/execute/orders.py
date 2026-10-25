@@ -1,18 +1,17 @@
-"""Idempotent order placement and pre-flight checks.
+"""Order placement, cancellation and repricing against the Kalshi V2 order API.
 
-Flow:
-  1. Pre-flight: re-query orderbook within T seconds; abort if price moved > slippage limit.
-  2. Submit: POST /portfolio/orders with client_order_id for idempotency.
-  3. Record: write Order artifact to ledger.
-  4. Return the KalshiOrder response.
+Flow for an entry:
+  1. Pre-flight: re-read the orderbook for the correct side and re-quote the
+     post-only price, never above the approved max price. Check cash.
+  2. Submit: POST /portfolio/events/orders (idempotent via client_order_id).
+  3. Record: the local Order moves APPROVED → SUBMITTED (or FILLED if it
+     matched immediately), or FAILED with the API's error.
 
-The Execute Agent calls place_order(). It never sees raw credentials or
-private key material; auth.sign_request() handles that transparently.
+This module never sees key material; auth.sign_request() signs each request.
 """
 
 from __future__ import annotations
 
-import asyncio
 import os
 from datetime import datetime, timezone
 
@@ -20,32 +19,41 @@ from src.common.ledger import Ledger
 from src.common.logging import get_logger
 from src.common.schemas import (
     ApprovedOrder,
-    Fill,
     KalshiEnv,
     Order,
+    OrderPurpose,
     OrderStatus,
     Side,
+    new_id,
+    utcnow,
 )
 from src.kalshi_client.client import KalshiClient
-from src.kalshi_client.models import CreateOrderRequest, KalshiOrder
+from src.kalshi_client.models import CreateOrderV2Request
+from src.qa.pricing import FeeModel, passive_price
 
 log = get_logger("execute_agent")
 
-_ENV = os.getenv("KALSHI_ENV", "demo").lower()
 
-# Max allowed price drift (bps) between QA approval and actual submission.
-# Read from risk.yaml at call time so dashboard edits take effect immediately.
-# Falls back to env var, then 500bps if neither is set.
-def _load_slippage_bps() -> int:
-    try:
-        import yaml
-        from pathlib import Path
-        cfg = yaml.safe_load(
-            (Path(__file__).parents[2] / "config" / "risk.yaml").read_text(encoding="utf-8")
-        )
-        return int(cfg.get("preflight", {}).get("max_slippage_bps", 500))
-    except Exception:
-        return int(os.getenv("PREFLIGHT_SLIPPAGE_BPS", "500"))
+class PreflightError(ValueError):
+    """The order should not be sent right now (price moved, no cash, halted)."""
+
+
+def _env() -> KalshiEnv:
+    return KalshiEnv(os.getenv("KALSHI_ENV", "demo").lower())
+
+
+def _unix(ts: datetime | None) -> int | None:
+    if ts is None:
+        return None
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return int(ts.timestamp())
+
+
+def _side_price_from_yes(yes_cents: int | None, side: Side) -> int | None:
+    if yes_cents is None:
+        return None
+    return yes_cents if side == Side.YES else 100 - yes_cents
 
 
 # ---------------------------------------------------------------------------
@@ -53,32 +61,100 @@ def _load_slippage_bps() -> int:
 # ---------------------------------------------------------------------------
 
 
-async def preflight_check(
+async def preflight(
     client: KalshiClient,
     approved: ApprovedOrder,
-    slippage_bps: int = _PREFLIGHT_SLIPPAGE_BPS,
-) -> tuple[bool, str]:
-    """Re-query the orderbook and abort if price has drifted too much.
-
-    Returns (ok, reason).
-    """
+    fees: FeeModel | None = None,
+) -> tuple[int, int, str]:
+    """Return (price_cents, contracts, note) to send now, or raise PreflightError."""
+    fees = fees or FeeModel()
     ob = await client.get_orderbook(approved.market_ticker)
-    mid = ob.mid_price()
-    if mid is None:
-        return False, "No orderbook mid available at submission time"
+    side = approved.side
+    max_price = approved.max_price_cents or approved.limit_price_cents
 
-    drift = abs(approved.limit_price_cents - mid) / max(mid, 1) * 10000
-    if drift > slippage_bps:
-        return False, (
-            f"Price moved {drift:.0f}bps from approved {approved.limit_price_cents}¢ "
-            f"to current mid {mid:.1f}¢ (limit: {slippage_bps}bps)"
-        )
-    return True, "ok"
+    if approved.post_only:
+        price = passive_price(ob, side, max_price)
+        if price is None:
+            raise PreflightError(
+                f"{side.value} best bid {ob.bid(side)}¢ is above our max {max_price}¢"
+            )
+    else:
+        ask = ob.ask(side)
+        if ask is None or ask > max_price:
+            raise PreflightError(f"{side.value} ask {ask}¢ is above our max {max_price}¢")
+        price = ask
+
+    count = approved.size_contracts
+    balance = (await client.get_balance()).balance
+    per_contract = price + fees.per_contract_cents(price, maker=approved.post_only)
+    affordable = int(balance // max(per_contract, 1))
+    note = ""
+    if affordable < count:
+        if affordable < 1:
+            raise PreflightError(f"Cash ${balance / 100:.2f} can't cover 1 contract at {price}¢")
+        note = f"size cut {count}→{affordable} to fit cash ${balance / 100:.2f}"
+        count = affordable
+    if price != approved.limit_price_cents:
+        note = (note + "; " if note else "") + f"re-quoted {approved.limit_price_cents}¢→{price}¢"
+    return price, count, note
 
 
 # ---------------------------------------------------------------------------
-# Order placement
+# Submission
 # ---------------------------------------------------------------------------
+
+
+async def _submit(order: Order, client: KalshiClient, ledger: Ledger, post_only: bool,
+                  tif: str = "good_till_canceled", reduce_only: bool | None = None) -> Order:
+    req = CreateOrderV2Request.for_side(
+        ticker=order.market_ticker,
+        side=order.side,
+        action=order.action,
+        price_cents=order.limit_price_cents,
+        count=order.size_contracts,
+        time_in_force=tif,
+        client_order_id=order.client_order_id,
+        expiration_time=_unix(order.expires_at) if tif == "good_till_canceled" else None,
+        post_only=post_only or None,
+        reduce_only=reduce_only,
+    )
+    try:
+        resp = await client.create_order(req)
+    except Exception as e:
+        order.status = OrderStatus.FAILED
+        order.status_reason = str(e)[:500]
+        order.last_updated_at = utcnow()
+        ledger.save_order(order)
+        ledger.append_audit("ORDER_FAILED", "execute_agent",
+                            {"order_id": order.order_id, "rec_id": order.rec_id, "error": str(e)[:500]})
+        log.error("order_failed", order_id=order.order_id, ticker=order.market_ticker, error=str(e))
+        raise
+
+    order.kalshi_order_id = resp.order_id
+    order.submitted_at = order.last_updated_at = utcnow()
+    order.filled_contracts = resp.fill_count
+    if resp.fill_count and resp.average_fill_price is not None:
+        order.avg_fill_price_cents = _side_price_from_yes(resp.average_fill_price, order.side)
+    if resp.fill_count >= order.size_contracts:
+        order.status = OrderStatus.FILLED
+    elif resp.fill_count > 0:
+        order.status = OrderStatus.PARTIALLY_FILLED
+    elif tif == "immediate_or_cancel":
+        order.status = OrderStatus.CANCELLED
+        order.status_reason = "IOC: nothing matched"
+    else:
+        order.status = OrderStatus.SUBMITTED
+    ledger.save_order(order)
+    ledger.append_audit("ORDER_SUBMITTED", "execute_agent", {
+        "order_id": order.order_id, "rec_id": order.rec_id, "kalshi_order_id": resp.order_id,
+        "ticker": order.market_ticker, "side": order.side.value, "action": order.action,
+        "price": order.limit_price_cents, "size": order.size_contracts,
+        "filled": resp.fill_count, "purpose": order.purpose.value,
+    })
+    log.info("order_submitted", ticker=order.market_ticker, side=order.side.value,
+             action=order.action, price=order.limit_price_cents, size=order.size_contracts,
+             filled=resp.fill_count, kalshi_order_id=resp.order_id)
+    return order
 
 
 async def place_order(
@@ -86,118 +162,144 @@ async def place_order(
     rec_id: str,
     client: KalshiClient,
     ledger: Ledger,
-    skip_preflight: bool = False,
+    *,
+    existing: Order | None = None,
+    fees: FeeModel | None = None,
+    market_close_time: datetime | None = None,
 ) -> Order:
-    """Submit an approved order to Kalshi.  Idempotent via client_order_id.
+    """Pre-flight and submit an approved entry order.
 
-    Returns the local Order record (including its status after submission).
+    ``existing`` is the PENDING_APPROVAL / APPROVED record from the HITL flow;
+    it is updated in place rather than duplicated.
+    Raises PreflightError when the order should not go out now.
     """
     if ledger.is_halted():
-        raise RuntimeError("System is HALTED — refusing to place order")
+        raise PreflightError("System is HALTED — refusing to place order")
 
-    # Pre-flight
-    if not skip_preflight:
-        ok, reason = await preflight_check(client, approved, slippage_bps=_load_slippage_bps())
-        if not ok:
-            log.warning("preflight_failed", rec_id=rec_id, reason=reason)
-            ledger.append_audit("PREFLIGHT_ABORT", "execute_agent",
-                                {"rec_id": rec_id, "reason": reason})
-            raise ValueError(f"Pre-flight check failed: {reason}")
+    try:
+        price, count, note = await preflight(client, approved, fees)
+    except PreflightError as e:
+        ledger.append_audit("PREFLIGHT_ABORT", "execute_agent", {"rec_id": rec_id, "reason": str(e)})
+        log.warning("preflight_blocked", rec_id=rec_id, ticker=approved.market_ticker, reason=str(e))
+        if existing is not None:
+            existing.status = OrderStatus.CANCELLED
+            existing.status_reason = f"Pre-flight: {e}"
+            existing.last_updated_at = utcnow()
+            ledger.save_order(existing)
+        raise
 
-    # Map our schema to the API request
-    side_str = approved.side.value.lower()   # "yes" | "no"
-    price_field = "yes_price" if approved.side == Side.YES else "no_price"
-
-    expiry_ts: int | None = None
-    if approved.expiry_ts:
-        expiry_ts = int(approved.expiry_ts.timestamp())
-
-    req = CreateOrderRequest(
-        ticker=approved.market_ticker,
-        action="buy",
-        side=side_str,
-        type="limit",
-        count=approved.size_contracts,
-        **{price_field: approved.limit_price_cents},
-        expiration_ts=expiry_ts,
-        client_order_id=approved.client_order_id,
-    )
-
-    # Create local record first so we have an audit trail even if API call fails
-    local_order = Order(
+    order = existing or Order(
         client_order_id=approved.client_order_id,
         rec_id=rec_id,
         market_ticker=approved.market_ticker,
         side=approved.side,
-        order_type=approved.order_type,
-        limit_price_cents=approved.limit_price_cents,
-        size_contracts=approved.size_contracts,
-        status=OrderStatus.APPROVED,
-        env=KalshiEnv(_ENV),
+        env=_env(),
+        limit_price_cents=price,
+        size_contracts=count,
     )
-    ledger.save_order(local_order)
+    order.limit_price_cents = price
+    order.max_price_cents = approved.max_price_cents or price
+    order.size_contracts = count
+    order.purpose = OrderPurpose.ENTRY
+    order.action = "buy"
+    order.expires_at = approved.expiry_ts
+    order.market_close_time = market_close_time or order.market_close_time
+    order.status = OrderStatus.APPROVED
+    order.status_reason = note
+    order.last_updated_at = utcnow()
+    ledger.save_order(order)
+    return await _submit(order, client, ledger, post_only=approved.post_only)
 
-    try:
-        kalshi_order: KalshiOrder = await client.create_order(req)
-        local_order.kalshi_order_id = kalshi_order.order_id
-        local_order.submitted_at = datetime.utcnow()
-        local_order.status = OrderStatus.SUBMITTED
-        local_order.last_updated_at = datetime.utcnow()
-        ledger.save_order(local_order)
-        ledger.append_audit("ORDER_SUBMITTED", "execute_agent", {
-            "rec_id": rec_id,
-            "order_id": local_order.order_id,
-            "kalshi_order_id": kalshi_order.order_id,
-            "ticker": approved.market_ticker,
-            "side": side_str,
-            "price": approved.limit_price_cents,
-            "size": approved.size_contracts,
-        })
-        log.info("order_submitted", rec_id=rec_id, kalshi_order_id=kalshi_order.order_id)
-    except Exception as e:
-        local_order.status = OrderStatus.FAILED
-        local_order.last_updated_at = datetime.utcnow()
-        ledger.save_order(local_order)
-        ledger.append_audit("ORDER_FAILED", "execute_agent",
-                            {"rec_id": rec_id, "error": str(e)})
-        log.error("order_failed", rec_id=rec_id, error=str(e))
-        raise
 
-    return local_order
+async def cancel(order: Order, client: KalshiClient, ledger: Ledger, reason: str) -> Order:
+    """Cancel a resting order on Kalshi and record why."""
+    if order.kalshi_order_id:
+        try:
+            await client.cancel_order(order.kalshi_order_id, order.market_ticker)
+        except Exception as e:
+            # A 404 usually means it already filled or expired; reconciliation will settle it
+            log.warning("cancel_failed", order_id=order.order_id, error=str(e))
+            ledger.append_audit("CANCEL_FAILED", "order_manager",
+                                {"order_id": order.order_id, "error": str(e)[:300]})
+            return order
+    order.status = OrderStatus.CANCELLED
+    order.status_reason = reason
+    order.last_updated_at = utcnow()
+    ledger.save_order(order)
+    ledger.append_audit("ORDER_CANCELLED", "order_manager",
+                        {"order_id": order.order_id, "ticker": order.market_ticker, "reason": reason})
+    return order
+
+
+async def replace_at(
+    order: Order, new_price: int, client: KalshiClient, ledger: Ledger
+) -> Order | None:
+    """Cancel ``order`` and post its unfilled remainder at ``new_price``."""
+    remaining = order.remaining_contracts
+    await cancel(order, client, ledger, reason=f"repriced {order.limit_price_cents}¢→{new_price}¢")
+    if order.status != OrderStatus.CANCELLED or remaining < 1:
+        return None
+    replacement = Order(
+        client_order_id=new_id(),
+        rec_id=order.rec_id,
+        market_ticker=order.market_ticker,
+        side=order.side,
+        action=order.action,
+        purpose=order.purpose,
+        limit_price_cents=new_price,
+        max_price_cents=order.max_price_cents,
+        size_contracts=remaining,
+        status=OrderStatus.APPROVED,
+        expires_at=order.expires_at,
+        market_close_time=order.market_close_time,
+        reprice_count=order.reprice_count + 1,
+        replaces_order_id=order.order_id,
+        env=order.env,
+    )
+    ledger.save_order(replacement)
+    return await _submit(replacement, client, ledger, post_only=True)
+
+
+async def sell_now(
+    ticker: str, side: Side, count: int, floor_price: int, rec_id: str,
+    client: KalshiClient, ledger: Ledger, reason: str,
+) -> Order:
+    """Immediately sell up to ``count`` contracts of ``side``, accepting no less than ``floor_price``.
+
+    Uses IOC + reduce_only so it can only shrink an existing position.
+    """
+    order = Order(
+        client_order_id=new_id(), rec_id=rec_id, market_ticker=ticker, side=side,
+        action="sell", purpose=OrderPurpose.EXIT, limit_price_cents=max(1, floor_price),
+        size_contracts=count, status=OrderStatus.APPROVED, status_reason=reason, env=_env(),
+    )
+    ledger.save_order(order)
+    return await _submit(order, client, ledger, post_only=False,
+                         tif="immediate_or_cancel", reduce_only=True)
 
 
 # ---------------------------------------------------------------------------
-# Flatten: cancel all open orders and market-limit close all positions
+# Flatten: cancel all open orders and close all positions
 # ---------------------------------------------------------------------------
 
 
 async def flatten_all(client: KalshiClient, ledger: Ledger, actor: str = "user") -> dict:
-    """Cancel all open orders and attempt to close all positions."""
+    """Cancel every resting order, then sell every position at any price."""
     cancelled = await client.cancel_all_orders()
+    for o in ledger.get_orders_by_status(OrderStatus.SUBMITTED.value,
+                                         OrderStatus.PARTIALLY_FILLED.value):
+        o.status, o.status_reason, o.last_updated_at = OrderStatus.CANCELLED, "flatten", utcnow()
+        ledger.save_order(o)
     ledger.append_audit("FLATTEN_CANCEL_ORDERS", actor, {"cancelled": cancelled})
 
-    positions = await client.get_positions()
     closed: list[str] = []
     errors: list[str] = []
-
-    for pos in positions:
-        if pos.position == 0:
+    for pos in await client.get_positions():
+        if pos.side is None:
             continue
-        side = Side.YES if pos.position > 0 else Side.NO
-        size = abs(pos.position)
-        # Use market-limit: price 1¢ for YES (want to sell), 99¢ for NO
-        price = 1 if side == Side.YES else 99
-        req = CreateOrderRequest(
-            ticker=pos.market_ticker,
-            action="sell",
-            side=side.value.lower(),
-            type="limit",
-            count=size,
-            yes_price=price if side == Side.YES else None,
-            no_price=price if side == Side.NO else None,
-        )
         try:
-            await client.create_order(req)
+            await sell_now(pos.market_ticker, pos.side, abs(pos.position), 1, rec_id="flatten",
+                           client=client, ledger=ledger, reason="flatten")
             closed.append(pos.market_ticker)
         except Exception as e:
             errors.append(f"{pos.market_ticker}: {e}")

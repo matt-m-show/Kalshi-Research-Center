@@ -1,126 +1,123 @@
 """Tests for the SQLite ledger."""
 
-import tempfile
-from datetime import datetime
-from pathlib import Path
+from datetime import timedelta
 
-import pytest
+from sqlalchemy import text
 
-from src.common.ledger import Ledger
 from src.common.schemas import (
-    Confidence,
+    Assessment,
     Decision,
     DecisionVerdict,
     Fill,
-    KalshiEnv,
+    MarketSettlement,
     Order,
     OrderStatus,
     Recommendation,
+    ResearchRun,
     Side,
-    SystemState,
-    TimeHorizon,
-    TrustTier,
+    utcnow,
 )
 
 
-@pytest.fixture
-def ledger(tmp_path):
-    db = tmp_path / "test_ledger.db"
-    import unittest.mock as mock
-    # Redirect DATA_DIR and AUDIT_LOG to tmp
-    with mock.patch("src.common.ledger.DATA_DIR", tmp_path), \
-         mock.patch("src.common.ledger.AUDIT_LOG", tmp_path / "audit.log"):
-        yield Ledger(db_path=db)
+def _rec(ticker="KXTEST-1") -> Recommendation:
+    return Recommendation(market_ticker=ticker, event_ticker="KXTEST", side=Side.YES,
+                          limit_price_cents=50, target_size_contracts=10, estimated_fair_prob=0.6)
 
 
-def _make_rec(ticker="KXTEST-1") -> Recommendation:
-    return Recommendation(
-        market_ticker=ticker,
-        event_ticker="KXTEST",
-        side=Side.YES,
-        limit_price_cents=50,
-        target_size_contracts=10,
-        estimated_fair_prob=0.60,
-        market_implied_prob=0.50,
-        edge_bps=1000,
-        time_horizon=TimeHorizon.SWING,
-        exit_conditions={"take_profit_prob": 0.68, "stop_loss_prob": 0.40, "invalidation_event": "None"},
-        confidence=Confidence.MEDIUM,
-        thesis="Test thesis.",
-        sources=[{"title": "AP", "url": "https://ap.org", "retrieved_at": datetime.utcnow(), "trust_tier": TrustTier.PRIMARY}],
-        hard_constraints_declared={"must_be_in_universe": True, "respects_max_position_pct": True},
-    )
+def _order(**kw) -> Order:
+    base = dict(client_order_id="c", rec_id="rec-1", market_ticker="KXTEST-1", side=Side.YES,
+                limit_price_cents=50, size_contracts=10, status=OrderStatus.PENDING_APPROVAL)
+    base.update(kw)
+    return Order(**base)
 
 
-class TestRecommendations:
-    def test_save_and_retrieve(self, ledger):
-        rec = _make_rec()
+class TestRecommendationsAndDecisions:
+    def test_round_trip(self, ledger):
+        rec = _rec()
         ledger.save_recommendation(rec)
-        retrieved = ledger.get_recommendation(rec.rec_id)
-        assert retrieved is not None
-        assert retrieved.rec_id == rec.rec_id
-        assert retrieved.market_ticker == rec.market_ticker
-
-    def test_missing_returns_none(self, ledger):
+        ledger.save_decision(Decision(rec_id=rec.rec_id, decision=DecisionVerdict.APPROVE,
+                                      reason_codes=["EDGE_OK"]))
+        assert ledger.get_recommendation(rec.rec_id).market_ticker == rec.market_ticker
+        assert ledger.get_decision(rec.rec_id).decision == DecisionVerdict.APPROVE
         assert ledger.get_recommendation("nonexistent") is None
 
-
-class TestDecisions:
-    def test_save_and_retrieve(self, ledger):
-        rec = _make_rec()
-        ledger.save_recommendation(rec)
-        decision = Decision(
-            rec_id=rec.rec_id,
-            decision=DecisionVerdict.APPROVE,
-            reason_codes=["SIZE_OK"],
-        )
-        ledger.save_decision(decision)
-        retrieved = ledger.get_decision(rec.rec_id)
-        assert retrieved is not None
-        assert retrieved.decision == DecisionVerdict.APPROVE
+    def test_ids_are_unique_per_recommendation(self, ledger):
+        a, b = _rec(), _rec()
+        ledger.save_recommendation(a)
+        ledger.save_recommendation(b)
+        with ledger._session() as s:
+            assert s.execute(text("SELECT COUNT(*) FROM recommendations")).scalar() == 2
 
 
 class TestOrders:
-    def test_save_and_retrieve_by_status(self, ledger):
-        order = Order(
-            client_order_id="test-coid-1",
-            rec_id="rec-1",
-            market_ticker="KXTEST-1",
-            side=Side.YES,
-            limit_price_cents=50,
-            size_contracts=10,
-            status=OrderStatus.PENDING_APPROVAL,
-        )
-        ledger.save_order(order)
-        pending = ledger.get_orders_by_status(OrderStatus.PENDING_APPROVAL.value)
-        assert any(o.order_id == order.order_id for o in pending)
+    def test_status_query_with_several_statuses(self, ledger):
+        ledger.save_order(_order(status=OrderStatus.SUBMITTED))
+        ledger.save_order(_order(status=OrderStatus.PARTIALLY_FILLED))
+        ledger.save_order(_order(status=OrderStatus.FILLED))
+        got = ledger.get_orders_by_status("SUBMITTED", "PARTIALLY_FILLED")
+        assert len(got) == 2
+
+    def test_status_query_is_parameterized(self, ledger):
+        ledger.save_order(_order())
+        assert ledger.get_orders_by_status("x') OR ('1'='1") == []
+
+    def test_lookup_by_kalshi_id(self, ledger):
+        o = _order(kalshi_order_id="k-9", status=OrderStatus.SUBMITTED)
+        ledger.save_order(o)
+        assert ledger.get_order_by_kalshi_id("k-9").order_id == o.order_id
+
+    def test_expire_unsent(self, ledger):
+        old = _order(status=OrderStatus.APPROVED, last_updated_at=utcnow() - timedelta(hours=30))
+        sent = _order(status=OrderStatus.APPROVED, kalshi_order_id="k1",
+                      last_updated_at=utcnow() - timedelta(hours=30))
+        fresh = _order(status=OrderStatus.APPROVED)
+        for o in (old, sent, fresh):
+            ledger.save_order(o)
+        assert ledger.expire_unsent_orders(24) == 1
+        assert ledger.get_order(old.order_id).status == OrderStatus.EXPIRED
+
+
+class TestFillsAndSettlements:
+    def test_fill_dedupe(self, ledger):
+        ledger.save_fill(Fill(kalshi_trade_id="t1", order_id="o1", rec_id="r1",
+                              market_ticker="KXTEST-1", side=Side.YES, price_cents=50,
+                              count=2, is_taker=False))
+        assert ledger.has_fill("t1") and not ledger.has_fill("t2")
+        assert ledger.latest_fill_time() is not None
+
+    def test_settlement_recorded_once(self, ledger):
+        st = MarketSettlement(market_ticker="KXTEST-1", result="yes", pnl_cents=40,
+                              settled_at=utcnow())
+        assert ledger.save_settlement(st) is True
+        assert ledger.save_settlement(st) is False
+
+
+class TestAssessmentsAndRuns:
+    def test_recent_and_resolution(self, ledger):
+        ledger.save_assessment(Assessment(market_ticker="A", fair_yes_prob=0.4))
+        ledger.save_assessment(Assessment(market_ticker="B", skip_reason="no info"))
+        assert ledger.recently_assessed_tickers(1) == {"A", "B"}
+        assert ledger.unresolved_assessment_tickers() == {"A", "B"}
+        assert ledger.resolve_assessments("A", False, utcnow()) == 1
+        assert [a.market_ticker for a in ledger.list_assessments(resolved_only=True)] == ["A"]
+
+    def test_run_spend(self, ledger):
+        ledger.save_run(ResearchRun(cost_usd=0.12))
+        ledger.save_run(ResearchRun(cost_usd=0.08))
+        assert abs(ledger.api_spend_since(utcnow() - timedelta(days=1)) - 0.20) < 1e-9
+        assert len(ledger.list_runs()) == 2
 
 
 class TestSystemState:
-    def test_default_not_halted(self, ledger):
+    def test_halt_resume(self, ledger, tmp_path):
         assert not ledger.is_halted()
-
-    def test_halt_and_resume(self, ledger):
         ledger.halt("test halt")
-        assert ledger.is_halted()
+        assert ledger.is_halted() and (tmp_path / "HALT").exists()
         ledger.resume()
         assert not ledger.is_halted()
 
-    def test_halt_file_created(self, ledger, tmp_path):
-        import unittest.mock as mock
-        with mock.patch("src.common.ledger.DATA_DIR", tmp_path):
-            ledger.halt("test")
-            assert (tmp_path / "HALT").exists()
-
-
-class TestAuditLog:
-    def test_append_and_chain(self, ledger):
-        ledger.append_audit("TEST_EVENT_1", "test", {"key": "val1"})
-        ledger.append_audit("TEST_EVENT_2", "test", {"key": "val2"})
-        # No assertion on hash value — just verify no exceptions and both written
-        with ledger._session() as s:
-            from sqlalchemy import text
-            rows = s.execute(text("SELECT seq, event_type FROM audit ORDER BY seq")).fetchall()
-        types = [r[1] for r in rows]
-        assert "TEST_EVENT_1" in types
-        assert "TEST_EVENT_2" in types
+    def test_audit_chain(self, ledger):
+        ledger.append_audit("E1", "test", {"k": "¢ ok"})
+        ledger.append_audit("E2", "test", {"k": 2})
+        rows = ledger.list_audit()
+        assert [r["type"] for r in rows[:2]] == ["E2", "E1"]

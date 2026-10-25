@@ -1,4 +1,6 @@
-# Updated via dashboard — 2026-05-10 12:56 UTC
+# config/risk.yaml — position sizing and risk limits.
+# Percentages are fractions (0.25 = 25%). Dollar amounts are USD.
+# Sizing never uses more than the cash actually in the Kalshi account.
 bankroll:
   total_capital_usd: 100
   reserve_pct: 0.05
@@ -8,27 +10,40 @@ per_trade:
   max_loss_usd: 50
   max_position_pct_of_bankroll: 0.75
   max_size_contracts: 50
+  min_edge_cents: 3            # required edge per contract after fees
 per_day:
   max_drawdown_usd: 90
   max_new_trades: 5
   max_open_exposure_usd: 190
 concentration:
-  max_pct_per_event: 50
-  max_pct_per_category: 50
+  max_pct_per_event: 0.5
+  max_pct_per_category: 0.5
   max_correlated_positions: 3
 liquidity_floors:
   min_open_interest: 0
   min_daily_volume_contracts: 0
-  max_spread_bps: 2000
+  max_spread_cents: 15         # skip markets whose bid/ask spread is wider
+execution:
+  entry_style: passive         # passive = post-only bid inside the spread; take = buy at the ask
+  reprice_interval_minutes: 10 # how often an outbid order may move up (never above its max price)
+  max_reprices: 6
+  order_ttl_hours: 6           # cancel unfilled entry orders after this long
+  cancel_before_close_minutes: 15
+exits:                         # only for positions this system opened
+  enabled: true
+  take_profit_capture: 0.8     # sell once the bid has captured 80% of the move from entry to fair value
+  stop_loss_pct: 0.5           # sell if the bid falls 50% below entry
+  stop_loss_min_hours_to_close: 0.5
+  max_slippage_cents: 2        # accept up to 2¢ below the bid when selling
+  news_check_minutes: 120      # local model checks each position for invalidating news (0 = off)
+  on_invalidation: alert       # alert | exit
 position_sizing:
   mode: fractional_kelly
   kelly_fraction: 0.25
 kill_switches:
   consecutive_losses_halt: 5
-  portfolio_drawdown_halt_pct: 50
+  portfolio_drawdown_halt_pct: 0.5
   api_error_rate_halt_per_min: 10
 research_quality:
   max_brier_score_for_category: 0.3
   min_trades_before_brier_gate: 20
-preflight:
-  max_slippage_bps: 1000

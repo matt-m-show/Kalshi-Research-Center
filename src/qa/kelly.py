@@ -50,20 +50,22 @@ def kelly_contracts(
     bankroll_cents: int,
     max_position_pct: float,
     max_contracts: int,
+    kelly_fraction: float = 0.25,
 ) -> int:
-    """Compute the number of contracts to buy under ¼-Kelly with hard caps.
+    """Compute the number of contracts to buy under fractional Kelly with hard caps.
 
     Args:
-        estimated_prob: Research Agent's probability estimate.
-        limit_price_cents: Proposed limit price (cost per contract).
+        estimated_prob: Fair probability of the side being bought.
+        limit_price_cents: Proposed limit price (cost per contract) of that side.
         bankroll_cents: Available bankroll in cents.
         max_position_pct: Hard cap as a fraction of bankroll (e.g. 0.02 for 2%).
         max_contracts: Absolute contract count cap.
+        kelly_fraction: Fraction of full Kelly to bet (0.25 = quarter Kelly).
 
     Returns:
         Integer number of contracts (≥ 0). 0 means "don't trade".
     """
-    fraction = quarter_kelly_fraction(estimated_prob, limit_price_cents)
+    fraction = full_kelly_fraction(estimated_prob, limit_price_cents) * kelly_fraction
     if fraction <= 0.0:
         return 0
 

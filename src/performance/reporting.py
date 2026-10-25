@@ -108,5 +108,7 @@ def save_rolling_metrics(metrics: RollingMetrics) -> None:
         "sortino_30d": metrics.sortino_30d,
         "pnl_by_category": metrics.pnl_by_category,
         "consecutive_losses": metrics.consecutive_losses,
+        "assessment_brier": metrics.assessment_brier,
+        "assessments_resolved": metrics.assessments_resolved,
     }
-    (METRICS_DIR / "rolling.json").write_text(json.dumps(data, indent=2, default=str))
+    (METRICS_DIR / "rolling.json").write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
